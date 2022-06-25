@@ -11,11 +11,6 @@ public class Ejercicio2 {
         for (int v1 : arr1) {
             int vcuadrado = (int) Math.pow(v1, 2);
 
-//            boolean seEncontro = false;
-//            for (int v2 : arr2) {
-//                if
-//            }
-
             if (!Arrays.asList(arr2).contains(vcuadrado)) {
                 return false;
             }
