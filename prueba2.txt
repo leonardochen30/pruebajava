@@ -1,0 +1,2385 @@
+package pa.com.globalbank.onboarding.utils.authorization;
+
+import com.auth0.jwt.JWT;
+import com.auth0.jwt.exceptions.JWTDecodeException;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import io.quarkus.logging.Log;
+import pa.com.globalbank.onboarding.utils.beans.JsonProvider;
+import pa.com.globalbank.onboarding.utils.exceptions.BusinessException;
+import pa.com.globalbank.onboarding.utils.exceptions.ErrorCodes;
+import pa.com.globalbank.onboarding.utils.exceptions.ErrorServices;
+import jakarta.enterprise.context.ApplicationScoped;
+
+import org.apache.commons.lang3.RandomStringUtils;
+
+import java.util.Base64;
+import java.util.HashSet;
+
+@ApplicationScoped
+public class AuthChecker {
+
+    private final JsonProvider jsonProvider;
+    public static final String FLOW_GROUP_ID = RandomStringUtils.random(10, true, true);
+
+    public AuthChecker(JsonProvider jsonProvider) {
+        this.jsonProvider = jsonProvider;
+    }
+
+    public Principal getUserAndValidateRoles(String authorization, String... authorities) {
+        try {
+            if (authorization == null || authorization.isBlank()) {
+                return null;
+            }
+
+            authorization = authorization.replaceFirst("Bearer ", "");
+
+            String payload = new String(Base64.getDecoder().decode(JWT.decode(authorization).getPayload()));
+            Principal principal = jsonProvider.parseJSON(payload, Principal.class);
+
+            if (principal.getGroups() == null) {
+                principal.setGroups(new HashSet<>());
+            }
+
+            if (principal.getGroups().isEmpty()) {
+                principal.getGroups().add(FLOW_GROUP_ID);
+            }
+
+            boolean haveAuthorities = false;
+
+            for (String auth : authorities) {
+                if (principal.getGroups().contains(auth)) {
+                    haveAuthorities = true;
+                    break;
+                }
+            }
+
+            if (haveAuthorities) {
+                Log.infof("***** AUTHORIZATION: email: %s, grantedAuthorities: %s", principal.getEmail(),
+                    principal.getGroups().toString());
+
+                return principal;
+            } else {
+                throw new BusinessException(ErrorCodes.FORBIDDEN_MSG,
+                    ErrorServices.AUTHORIZATION.name(), ErrorCodes.FORBIDDEN_CODE);
+            }
+        } catch (NullPointerException | JWTDecodeException | JsonProcessingException e) {
+            throw new BusinessException(ErrorCodes.FORBIDDEN_MSG,
+                ErrorServices.AUTHORIZATION.name(), ErrorCodes.FORBIDDEN_CODE);
+        }
+    }
+
+    public Principal getUserAndValidateRolesAndAuthorization(String authorization, String... authorities) {
+        Principal principal = getUserAndValidateRoles(authorization, authorities);
+
+        if (principal == null) {
+            throw new BusinessException(ErrorCodes.FORBIDDEN_MSG,
+                ErrorServices.AUTHORIZATION.name(), ErrorCodes.FORBIDDEN_CODE);
+        }
+
+        return principal;
+    }
+
+}
+
+---------------------------------
+
+package pa.com.globalbank.onboarding.utils.authorization;
+
+import com.fasterxml.jackson.annotation.JsonAlias;
+import lombok.Getter;
+import lombok.Setter;
+import java.util.Set;
+
+@Getter
+@Setter
+public class Principal {
+
+    @JsonAlias("preferred_username")
+    private String email;
+
+    private Set<String> groups;
+
+}
+
+-----------------------------
+
+package pa.com.globalbank.onboarding.utils.beans;
+
+import com.fasterxml.jackson.core.JacksonException;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.introspect.AnnotatedMember;
+import com.fasterxml.jackson.databind.introspect.JacksonAnnotationIntrospector;
+import org.jboss.logging.Logger;
+
+import jakarta.enterprise.context.ApplicationScoped;
+
+import java.io.IOException;
+import java.util.List;
+
+@ApplicationScoped
+public class JsonProvider {
+
+    private final ObjectMapper mapper;
+    private static final Logger log = Logger.getLogger(JsonProvider.class);
+
+    public JsonProvider(ObjectMapper mapper) {
+        this.mapper = mapper;
+    }
+
+    public boolean isValid(String json) {
+        try {
+            mapper.readTree(json);
+        } catch (JacksonException e) {
+            return false;
+        }
+
+        return true;
+    }
+
+    public String byteArrayToJSONUnPretty(byte[] bytes, Class<?> cls) {
+        if (bytes != null) {
+            try {
+                return toJSONUnPretty(mapper.readValue(bytes, cls));
+            } catch (IOException e) {
+                return null;
+            }
+        }
+
+        return null;
+    }
+
+    public String toJSON(Object object) {
+        if (object != null) {
+            try {
+                return mapper.writeValueAsString(object);
+            } catch (JsonProcessingException e) {
+                log.errorf(":: OBJECT FAILED TO MAP TO JSON STRING :: %s - %s",
+                    object.toString(), e.getMessage());
+
+                return null;
+            }
+        }
+
+        return null;
+    }
+
+    public String toJSONWithExclusion(Object object, List<String> exclusions) {
+        if (object != null) {
+            try {
+                ObjectMapper exceptMapper = new ObjectMapper();
+                exceptMapper.setAnnotationIntrospector(new JacksonAnnotationIntrospector() {
+                    @Override
+                    public boolean hasIgnoreMarker(final AnnotatedMember m) {
+                        return exclusions.contains(m.getName()) || super.hasIgnoreMarker(m);
+                    }
+                });
+
+                return exceptMapper.writeValueAsString(object);
+            } catch (JsonProcessingException e) {
+                log.errorf(":: OBJECT FAILED TO MAP TO JSON STRING :: %s-%s",
+                    object.toString(), e.getMessage());
+
+                return null;
+            }
+        }
+
+        return null;
+    }
+
+    public String toJSONUnPretty(Object object) {
+        return unPrettyJSON(toJSON(object));
+    }
+
+    public String unPrettyJSON(String json) {
+        try {
+            return mapper.readValue(json, JsonNode.class).toString();
+        } catch (Exception e) {
+            return json;
+        }
+    }
+
+    public <T> T parseJSON(String json, Class<T> valueType) throws JsonProcessingException {
+        return mapper.readValue(json, valueType);
+    }
+
+    public <T> T parseJSON(String json, TypeReference<T> valueType) throws JsonProcessingException {
+        return mapper.readValue(json, valueType);
+    }
+
+    public static <T> T copyCommonsProperties(Object source, Class<T> destinationClass) {
+        if (source == null) return null;
+
+        try {
+            ObjectMapper copyMapper = new ObjectMapper()
+                .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
+
+            return copyMapper.readValue(copyMapper.writeValueAsString(source), destinationClass);
+        } catch (JsonProcessingException e) {
+            log.errorf("::: An error occurred copying values from class type %s to %s :::",
+                source.getClass().getName(), destinationClass.getName());
+
+            return null;
+        }
+    }
+
+    public <T> T convertValue(Object fromValue, Class<T> toValueType) {
+        return mapper.convertValue(fromValue, toValueType);
+    }
+}
+
+-----------------------------------------------
+
+package pa.com.globalbank.onboarding.utils.commons;
+
+import org.apache.commons.lang3.StringUtils;
+
+import java.math.RoundingMode;
+import java.text.DecimalFormat;
+import java.text.DecimalFormatSymbols;
+import java.text.NumberFormat;
+import java.util.Locale;
+import java.util.regex.Pattern;
+
+public class CurrencyUtils {
+
+    private CurrencyUtils() {
+    }
+
+    private static final String[] UNITIES = {
+        "", "un ", "dos ", "tres ", "cuatro ", "cinco ", "seis ",
+        "siete ", "ocho ", "nueve "
+    };
+
+    private static final String[] TENS = {
+        "diez ", "once ", "doce ", "trece ", "catorce ", "quince ", "dieciseis ",
+        "diecisiete ", "dieciocho ", "diecinueve", "veinte ", "treinta ", "cuarenta ",
+        "cincuenta ", "sesenta ", "setenta ", "ochenta ", "noventa "
+    };
+
+    private static final String[] HUNDREDS = {
+        "", "ciento ", "doscientos ", "trescientos ", "cuatrocientos ", "quinientos ",
+        "seiscientos ", "setecientos ", "ochocientos ", "novecientos "
+    };
+    public static final String CERO = "cero ";
+
+    public static String currencyToLetters(String number, boolean capitalLetters) {
+        String literal;
+        String tenPart;
+
+        // si el numero utiliza (.) en lugar de (,) -> se reemplaza
+        number = number.replace(".", ",");
+
+        // si el numero no tiene parte decimal, se le agrega ,00
+        if (!number.contains(",")) {
+            number = number + ",00";
+        }
+
+        // se valida formato de entrada -> 0,00 y 999 999 999,00
+        if (Pattern.matches("\\d{1,9},\\d{1,2}", number)) {
+            // se divide el numero 0000000,00 -> entero y decimal
+            String[] numberPart = number.split(",");
+
+            if (numberPart[1].length() == 1) {
+                numberPart[1] += "0";
+            }
+
+            tenPart = String.format(" con %s/100", numberPart[1]);
+
+            // se convierte el numero a literal
+            if (Integer.parseInt(numberPart[0]) == 0) { //si el valor es cero
+                literal = CERO;
+            } else if (Integer.parseInt(numberPart[0]) > 999999) { //si es millon
+                literal = getMillions(numberPart[0]);
+            } else if (Integer.parseInt(numberPart[0]) > 999) { //si es miles
+                literal = getMiles(numberPart[0]);
+            } else if (Integer.parseInt(numberPart[0]) > 99) { //si es centena
+                literal = getHundreds(numberPart[0]);
+            } else if (Integer.parseInt(numberPart[0]) > 9) { //si es decena
+                literal = getTens(numberPart[0]);
+            } else { //sino unidades -> 9
+                literal = getUnities(numberPart[0]);
+            }
+
+            // devuelve el resultado en mayusculas o minusculas
+            if (capitalLetters) {
+                return (literal.trim() + tenPart).toUpperCase();
+            } else {
+                return literal.trim() + tenPart;
+            }
+        } else {
+            //error, no se puede convertir
+            return null;
+        }
+    }
+
+    public static String percentageToLetters(String number, boolean capitalLetters) {
+        String literal;
+        String tenPart;
+
+        // si el numero utiliza (.) en lugar de (,) -> se reemplaza
+        number = number.replace(".", ",");
+
+        if (!number.contains(",")) {
+            number = number + ",0";
+        }
+
+        if (Pattern.matches("\\d{1,9},\\d{1,2}", number)) {
+            String[] numberPart = number.split(",");
+
+            if (Integer.parseInt(numberPart[0]) == 0) { //si el valor es cero
+                literal = CERO;
+            } else if (Integer.parseInt(numberPart[0]) > 99) { //si es centena
+                literal = getHundreds(numberPart[0]);
+            } else if (Integer.parseInt(numberPart[0]) > 9) { //si es decena
+                literal = getTens(numberPart[0]);
+            } else { //sino unidades -> 9
+                literal = getUnities(numberPart[0]);
+            }
+
+            if (Integer.parseInt(numberPart[1]) == 0) { //si el valor es cero
+                tenPart = CERO;
+            } else if (Integer.parseInt(numberPart[1]) > 99) { //si es centena
+                tenPart = getHundreds(numberPart[1]);
+            } else if (Integer.parseInt(numberPart[1]) > 9) { //si es decena
+                tenPart = getTens(numberPart[1]);
+            } else { //sino unidades -> 9
+                tenPart = getUnities(numberPart[1]);
+            }
+
+            // devuelve el resultado en mayusculas o minusculas
+            var literalFull = literal.trim() + " punto " + tenPart.trim();
+
+            if (capitalLetters) {
+                return literalFull.toUpperCase();
+            } else {
+                return literalFull;
+            }
+        }
+
+        return null;
+    }
+
+    public static String decimalNumberToLetters(String number, boolean capitalLetters) {
+        String literal;
+
+        if (!Pattern.matches("\\d{1,9}", number)) {
+            return null;
+        }
+
+        var decimalNumber = Integer.parseInt(number);
+
+        if (decimalNumber == 0) { //si el valor es cero
+            literal = CERO;
+        } else if (decimalNumber > 99) { //si es centena
+            literal = getHundreds(number);
+        } else if (decimalNumber > 9) { //si es decena
+            literal = getTens(number);
+        } else { //sino unidades -> 9
+            literal = getUnities(number);
+        }
+
+        // devuelve el resultado en mayusculas o minusculas
+        if (capitalLetters) {
+            return literal.trim().toUpperCase();
+        } else {
+            return literal.trim();
+        }
+    }
+
+    /* funciones para convertir los numeros a literales */
+    private static String getUnities(String number) {
+        // 1 - 9
+        // si tuviera algun 0 antes se lo quita -> 09 = 9 o 009=9
+        String cleanNumber = number.substring(number.length() - 1);
+
+        return UNITIES[Integer.parseInt(cleanNumber)];
+    }
+
+    private static String getTens(String number) { // 99
+        int decimalNumber = Integer.parseInt(number);
+
+        if (decimalNumber < 10) {
+            //para casos como -> 01 - 09
+            return getUnities(number);
+        } else if (decimalNumber > 19) {
+            //para 20...99
+            String u = getUnities(number);
+            int i = Integer.parseInt(number.substring(0, 1)) + 8;
+            if (u.isEmpty()) {
+                //para 20,30,40,50,60,70,80,90
+                return TENS[i];
+            } else {
+                return TENS[i] + "y " + u;
+            }
+        } else { //numeros entre 11 y 19
+            return TENS[decimalNumber - 10];
+        }
+    }
+
+    private static String getHundreds(String number) {
+        // 999 o 099
+        if (Integer.parseInt(number) > 99) {
+            //es centena
+            if (Integer.parseInt(number) == 100) {
+                //caso especial
+                return " cien ";
+            } else {
+                return HUNDREDS[Integer.parseInt(number.substring(0, 1))]
+                    + getTens(number.substring(1));
+            }
+        } else {
+            //por Ej. 099 se quita el 0 antes de convertir a decenas
+            return getTens(Integer.parseInt(number) + "");
+        }
+    }
+
+    private static String getMiles(String number) {
+        // 999 999 obtiene las centenas
+        String hundreds = number.substring(number.length() - 3);
+        //obtiene los miles
+        String miles = number.substring(0, number.length() - 3);
+        //se comprueba que miles tenga valor entero
+        if (Integer.parseInt(miles) > 0) {
+            return getHundreds(miles) + "mil " + getHundreds(hundreds);
+        } else {
+            return getHundreds(hundreds);
+        }
+    }
+
+    private static String getMillions(String number) {
+        //000 000 000 se obtiene los miles
+        var miles = number.substring(number.length() - 6);
+
+        //se obtiene los millones
+        var million = number.substring(0, number.length() - 6);
+
+        String letter;
+
+        if (million.length() > 1) {
+            letter = getHundreds(million) + "millones ";
+        } else {
+            letter = getUnities(million) + "millon ";
+        }
+
+        return letter + getMiles(miles);
+    }
+
+    public static String believeToCurrency(double currency) {
+        var formatter = NumberFormat.getCurrencyInstance(Locale.US);
+
+        return formatter.format(currency);
+    }
+
+    public static String formatAmount(Double value) {
+        if (value == null) return "";
+
+        DecimalFormat df = new DecimalFormat("#,###,##0.00", new DecimalFormatSymbols(Locale.US));
+        df.setRoundingMode(RoundingMode.HALF_UP);
+
+        var formattedValue = df.format(value);
+
+        return StringUtils.replaceOnce(formattedValue, "$", "");
+    }
+
+}
+
+---------------------------------
+
+package pa.com.globalbank.onboarding.utils.commons;
+
+import jakarta.ws.rs.core.Response;
+
+public class ResponseFactory {
+
+    private ResponseFactory() {
+    }
+
+    public static Response ok() {
+        return Response.status(Response.Status.OK.getStatusCode())
+            .build();
+    }
+
+    public static Response okNoContent() {
+        return Response.status(Response.Status.NO_CONTENT.getStatusCode())
+            .build();
+    }
+
+    public static Response ok(Object body) {
+        return Response.status(Response.Status.OK.getStatusCode())
+                .entity(body)
+                .build();
+    }
+
+    public static Response unauthorized() {
+        return Response.status(Response.Status.UNAUTHORIZED.getStatusCode())
+            .build();
+    }
+
+    public static Response created() {
+        return Response.status(Response.Status.CREATED.getStatusCode())
+                .build();
+    }
+
+    public static Response created(Object body) {
+        return Response.status(Response.Status.CREATED.getStatusCode())
+            .entity(body)
+            .build();
+    }
+
+}
+
+------------------------------------
+
+package pa.com.globalbank.onboarding.utils.commons;
+
+import com.fasterxml.jackson.annotation.JsonInclude;
+import lombok.Getter;
+import lombok.Setter;
+
+@Getter
+@Setter
+@JsonInclude(JsonInclude.Include.NON_NULL)
+public class StandardResponse {
+
+    private String code;
+    private String message;
+
+    public StandardResponse(String code, String message) {
+        this.code = code;
+        this.message = message;
+    }
+
+    public static StandardResponse ok(String message) {
+        return new StandardResponse("0", message);
+    }
+
+}
+
+---------------------------------
+
+package pa.com.globalbank.onboarding.utils.config;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.quarkus.jackson.ObjectMapperCustomizer;
+import jakarta.inject.Singleton;
+import pa.com.globalbank.onboarding.utils.Generated;
+
+import java.util.TimeZone;
+
+@Singleton
+@Generated
+public class CustomObjectMapperCustomizer implements ObjectMapperCustomizer {
+
+    public void customize(ObjectMapper mapper) {
+        mapper.setTimeZone(TimeZone.getTimeZone("America/Panama"));
+    }
+
+}
+
+
+
+------------------
+
+package pa.com.globalbank.onboarding.utils.config;
+
+import io.quarkus.logging.Log;
+import io.quarkus.resteasy.reactive.jackson.runtime.mappers.DefaultMismatchedInputException;
+import org.eclipse.microprofile.config.inject.ConfigProperty;
+import pa.com.globalbank.onboarding.utils.Generated;
+import pa.com.globalbank.onboarding.utils.beans.JsonProvider;
+import io.vertx.core.http.HttpServerRequest;
+import org.apache.commons.io.IOUtils;
+
+import jakarta.ws.rs.container.ContainerRequestContext;
+import jakarta.ws.rs.container.ContainerRequestFilter;
+import jakarta.ws.rs.container.ContainerResponseContext;
+import jakarta.ws.rs.container.ContainerResponseFilter;
+import jakarta.ws.rs.core.Context;
+import jakarta.ws.rs.ext.Provider;
+import org.jboss.logging.MDC;
+import pa.com.globalbank.onboarding.utils.commons.StandardResponse;
+import pa.com.globalbank.onboarding.utils.exceptions.ErrorCodes;
+
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.TimeZone;
+import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+
+@Provider
+@Generated
+public class HttpInterceptor implements ContainerRequestFilter, ContainerResponseFilter {
+
+    public static final String REQUEST_START_TIME = "requestStartTime";
+    public static final String EXECUTION_ID = "executionId";
+    public static final String CLIENT_IP = "clientip";
+    public static final String X_ORIGINAL_FORWARDED_FOR = "x-original-forwarded-for";
+
+    private final JsonProvider jsonProvider;
+
+    @Context
+    HttpServerRequest request;
+
+    @ConfigProperty(name = "logging.ignore", defaultValue = "-")
+    String loggingIgnore;
+
+    public HttpInterceptor(JsonProvider jsonProvider) {
+        this.jsonProvider = jsonProvider;
+        TimeZone.setDefault(TimeZone.getTimeZone("America/Panama"));
+    }
+
+    @Override
+    public void filter(ContainerRequestContext requestContext) {
+        requestContext.setProperty(REQUEST_START_TIME, System.nanoTime());
+
+        final String method = requestContext.getMethod();
+        final String path = requestContext.getUriInfo().getPath();
+
+        // unique service exec ID
+        String executionId = requestContext.getHeaderString(EXECUTION_ID);
+        if (executionId == null || executionId.isBlank()) {
+            executionId = UUID.randomUUID().toString();
+        }
+
+        MDC.put(EXECUTION_ID, executionId);
+
+        String remoteAddress = getRemoteAddress(requestContext);
+
+        requestContext.getHeaders().add("ClientIpAddress", remoteAddress);
+
+        Log.infof("::: ===== SERVICE REQUEST ===== ::: IP: %s - %s - %s", remoteAddress, method, path);
+
+        if (loggingIgnore.contains(path)) {
+            return;
+        }
+
+        Log.infof("::: HEADERS ::: %s",
+            requestContext.getHeaders().entrySet().stream()
+                .filter(h -> !h.getKey().equalsIgnoreCase("Authorization"))
+                .map(h -> String.format("%s: %s", h.getKey(), h.getValue().toString()))
+                .collect(Collectors.joining(", ")));
+
+        if (!requestContext.getUriInfo().getPathParameters().isEmpty()) {
+            Log.infof("::: PATH PARAMETERS ::: %s",
+                requestContext.getUriInfo().getPathParameters().entrySet().stream()
+                    .map(p -> String.format("%s: [%s]", p.getKey(), String.join(", ", p.getValue())))
+                    .collect(Collectors.joining(", ")));
+        }
+
+        if (!requestContext.getUriInfo().getQueryParameters().isEmpty()) {
+            Log.infof("::: QUERY PARAMETERS ::: %s",
+                requestContext.getUriInfo().getQueryParameters().entrySet().stream()
+                    .map(p -> String.format("%s: [%s]", p.getKey(), String.join(", ", p.getValue())))
+                    .collect(Collectors.joining(", ")));
+        }
+
+        String contentType = Optional.ofNullable(requestContext.getHeaderString("Content-Type"))
+            .orElse("application/json");
+
+        if (requestContext.hasEntity() && !contentType.contains("multipart/form-data")) {
+            try {
+                ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                IOUtils.copy(requestContext.getEntityStream(), baos);
+                byte[] bytes = baos.toByteArray();
+
+                if (bytes.length > 0) {
+                    logRequestBody(bytes);
+
+                    requestContext.setEntityStream(new ByteArrayInputStream(bytes));
+                }
+            } catch (IOException e) {
+                Log.errorf("::: ERROR READING REQUEST ::: %s", e.getMessage());
+            }
+        }
+    }
+
+    private void logRequestBody(byte[] bytes) {
+        try {
+            Log.infof("::: REQUEST BODY ::: %s", jsonProvider.byteArrayToJSONUnPretty(bytes, Map.class));
+        } catch (Exception e) {
+            try {
+                Log.infof("::: REQUEST BODY ::: %s", jsonProvider.byteArrayToJSONUnPretty(bytes, List.class));
+            } catch (Exception ignored) {
+                Log.info("::: CANNOT PRINT REQUEST BODY :::");
+            }
+        }
+    }
+
+    private String getRemoteAddress(ContainerRequestContext requestContext) {
+        String remoteAddress = requestContext.getHeaders().containsKey("X-Real-Ip")
+            ? requestContext.getHeaderString("X-Real-Ip")
+            : requestContext.getHeaderString("x-real-ip");
+
+        if (requestContext.getHeaders().containsKey(CLIENT_IP)
+            || requestContext.getHeaders().containsKey("ClientIp")) {
+            remoteAddress = requestContext.getHeaders().containsKey(CLIENT_IP)
+                ? requestContext.getHeaderString(CLIENT_IP)
+                : requestContext.getHeaderString("ClientIp");
+        } else if (requestContext.getHeaders().containsKey(X_ORIGINAL_FORWARDED_FOR)
+            || requestContext.getHeaders().containsKey("X-Original-Forwarded-For")) {
+
+            remoteAddress = requestContext.getHeaders().containsKey(X_ORIGINAL_FORWARDED_FOR)
+                ? requestContext.getHeaderString(X_ORIGINAL_FORWARDED_FOR)
+                : requestContext.getHeaderString("X-Original-Forwarded-For");
+
+            remoteAddress = remoteAddress.split(",")[0];
+        } else if (remoteAddress == null || remoteAddress.isEmpty()) {
+            remoteAddress = request.remoteAddress().toString();
+        }
+
+        return remoteAddress;
+    }
+
+    @Override
+    public void filter(ContainerRequestContext requestContext, ContainerResponseContext responseContext) {
+        if (requestContext.getPropertyNames().contains(REQUEST_START_TIME)) {
+            long requestStartTime = Long.parseLong(requestContext.getProperty(REQUEST_START_TIME).toString());
+
+            Log.infof("::: ===== SERVICE RESPONSE ===== ::: %s - %s - response status: %d - exec time: %d ms",
+                requestContext.getMethod(), requestContext.getUriInfo().getPath(),
+                responseContext.getStatus(),
+                TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - requestStartTime) + 10);
+
+            if (loggingIgnore.contains(requestContext.getUriInfo().getPath())) {
+                return;
+            }
+
+            if (responseContext.hasEntity()) {
+                String responseBody = jsonProvider.toJSONUnPretty(responseContext.getEntity());
+
+                if (responseContext.getStatus() == 400
+                    && responseContext.getEntity()
+                    instanceof DefaultMismatchedInputException.MismatchedJsonInputError badRequestError) {
+
+                    var error = new StandardResponse(ErrorCodes.BAD_REQUEST_CODE,
+                        String.format("Field %s have invalid value", badRequestError.getAttributeName()));
+
+                    responseContext.setEntity(error);
+
+                    responseBody = jsonProvider.toJSONUnPretty(responseContext.getEntity());
+                }
+
+                Log.infof("::: RESPONSE BODY ::: %s", responseBody);
+            }
+        }
+
+        MDC.remove(EXECUTION_ID);
+    }
+
+}
+
+-----------------------
+
+package pa.com.globalbank.onboarding.utils.exceptions;
+
+import lombok.Getter;
+import lombok.Setter;
+import java.io.Serial;
+
+@Getter
+@Setter
+public class BusinessException extends RuntimeException {
+
+    @Serial
+    private static final long serialVersionUID = 1L;
+
+    protected final String domain;
+    protected final String code;
+
+    public BusinessException(String message, String domain, String code) {
+        super(message);
+
+        this.domain = domain;
+        this.code = code;
+    }
+
+}
+
+--------------------------
+
+package pa.com.globalbank.onboarding.utils.exceptions;
+
+public class ErrorCodes {
+
+    private ErrorCodes() {
+    }
+
+    public static final String UNAUTHORIZED_CODE = "401";
+    public static final String FORBIDDEN_CODE = "403";
+    public static final String REST_CLIENT_CODE = "406";
+    public static final String UNKNOWN_ERROR_CODE = "90000";
+    public static final String CTS_PROXY_UNKNOWN_ERROR_CODE = "90001";
+    public static final String CTS_PROXY_LOGIN_ERROR_CODE = "90002";
+    public static final String BAD_REQUEST_CODE = "400";
+    public static final String RESOURCE_NOT_FOUND_CODE = "404";
+    public static final String MISSING_PARAMETER_CODE = "407";
+
+    public static final String UNAUTHORIZED_MSG = "Service not available";
+    public static final String FORBIDDEN_MSG = "Forbidden";
+    public static final String REST_CLIENT_MSG = "Communication error";
+    public static final String UNKNOWN_ERROR_MSG = "Unknown error";
+    public static final String CTS_PROXY_UNKNOWN_ERROR_MSG = "Core banking communication error";
+    public static final String CTS_PROXY_LOGIN_ERROR_MSG = "Core banking authentication fail";
+    public static final String BAD_REQUEST_MSG = "Request have invalid values.";
+    public static final String RESOURCE_NOT_FOUND_MSG = "Resource not found";
+    public static final String MISSING_PARAMETER_MSG = "Parameter not found";
+
+}
+
+-------------------------
+
+package pa.com.globalbank.onboarding.utils.exceptions;
+
+import io.quarkus.logging.Log;
+import jakarta.ws.rs.core.Response;
+import jakarta.ws.rs.ext.Provider;
+import org.eclipse.microprofile.rest.client.ext.ResponseExceptionMapper;
+
+@Provider
+public class RestClientExceptionMapper implements ResponseExceptionMapper<RuntimeException> {
+
+    @Override
+    public RuntimeException toThrowable(Response response) {
+        Log.error("::::: REST CLIENT ERROR :::::");
+
+        if (response.getStatus() < 200 || response.getStatus() > 300) {
+            Log.errorf("::: Rest client: URL %s respond with status %s ::: %s",
+                response.getLocation(), response.getStatus(),
+                response.getStatusInfo().getReasonPhrase());
+
+            if (response.hasEntity()) {
+                String msg = response.readEntity(String.class);
+
+                Log.errorf("::: Rest error: %s :::", msg);
+            }
+
+            throw new BusinessException(ErrorCodes.REST_CLIENT_MSG,
+                ErrorServices.REST_CLIENT.name(), ErrorCodes.REST_CLIENT_CODE);
+        }
+
+        return null;
+    }
+}
+
+
+------------------
+
+package pa.com.globalbank.onboarding.utils.exceptions;
+
+import pa.com.globalbank.onboarding.utils.commons.StandardResponse;
+import io.quarkus.logging.Log;
+import jakarta.validation.ConstraintDefinitionException;
+import jakarta.ws.rs.NotFoundException;
+import jakarta.ws.rs.core.Response;
+import jakarta.ws.rs.ext.ExceptionMapper;
+import jakarta.ws.rs.ext.Provider;
+
+@Provider
+public class RestExceptionHandler implements ExceptionMapper<Exception> {
+
+    @Override
+    public Response toResponse(Exception e) {
+        Log.error(e);
+
+        if (e instanceof BusinessException exc) {
+            Log.errorf(":: BusinessException with error code %s-%s ::", exc.getCode(), exc.getMessage());
+
+            return Response.status(Response.Status.NOT_ACCEPTABLE.getStatusCode())
+                .entity(new StandardResponse(exc.getCode(), exc.getMessage()))
+                .build();
+        } else if (e instanceof ConstraintDefinitionException
+            || e.getMessage().equals("HTTP 400 Bad Request")) {
+
+            return Response.status(Response.Status.BAD_REQUEST.getStatusCode())
+                .entity(new StandardResponse(
+                    ErrorCodes.BAD_REQUEST_CODE, ErrorCodes.BAD_REQUEST_MSG))
+                .build();
+        } else {
+            if (e instanceof NotFoundException) {
+                return Response.status(Response.Status.NOT_FOUND.getStatusCode())
+                    .entity(new StandardResponse(
+                        ErrorCodes.RESOURCE_NOT_FOUND_CODE, ErrorCodes.RESOURCE_NOT_FOUND_MSG))
+                    .build();
+            } else {
+                return Response.status(Response.Status.NOT_ACCEPTABLE.getStatusCode())
+                    .entity(new StandardResponse(
+                        ErrorCodes.UNKNOWN_ERROR_CODE, ErrorCodes.UNKNOWN_ERROR_MSG))
+                    .build();
+            }
+        }
+    }
+}
+
+
+------------
+
+
+package pa.com.globalbank.onboarding.utils.exceptions;
+
+import jakarta.validation.ValidationException;
+import jakarta.ws.rs.core.Response;
+import jakarta.ws.rs.ext.ExceptionMapper;
+import jakarta.ws.rs.ext.Provider;
+import pa.com.globalbank.onboarding.utils.commons.StandardResponse;
+
+@Provider
+public class ValidationRestExceptionHandler
+    implements ExceptionMapper<ValidationException> {
+
+    @Override
+    public Response toResponse(ValidationException e) {
+        String errorMessage;
+
+        try {
+            errorMessage = e.getMessage()
+                .split(":")[1]
+                .trim();
+        } catch (Exception ex) {
+            errorMessage = "Request have invalid values.";
+        }
+
+        return Response.status(Response.Status.BAD_REQUEST.getStatusCode())
+            .entity(new StandardResponse(
+                ErrorCodes.BAD_REQUEST_CODE, errorMessage))
+            .build();
+    }
+
+}
+
+
+------------------
+
+
+package pa.com.globalbank.onboarding.utils.services.trace.dtos;
+
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Getter;
+import lombok.NoArgsConstructor;
+import lombok.Setter;
+
+import java.util.List;
+
+@Getter
+@Setter
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class TracingRequest {
+
+    private String token;
+    private String customerId;
+    private String product;
+    private String code;
+    private String type;
+    private String actionDetail;
+    private String errorDescription;
+    private String errorDetail;
+    private List<String> recipients;
+    private boolean sendNotification;
+
+}
+
+
+---------------
+
+package pa.com.globalbank.onboarding.utils.services.mail;
+
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Getter;
+import lombok.Setter;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+@Getter
+@Setter
+@Builder
+@AllArgsConstructor
+public class EmailRequest {
+
+    private String template;
+    private String from;
+    private List<String> recipients;
+    private List<String> cc;
+    private List<String> bcc;
+    private String subject;
+    private Map<String, Object> parameters;
+    private List<Attachment> attachments;
+
+    public EmailRequest() {
+        this.recipients = new ArrayList<>();
+        this.cc = new ArrayList<>();
+        this.bcc = new ArrayList<>();
+        this.attachments = new ArrayList<>();
+    }
+
+    @Override
+    public String toString() {
+        return String.format("template: %s, from: %s, to: %s, cc: %s, bcc: %s, subject: %s, params: [%s]",
+                template != null ? String.join(", ", template) : "",
+                from != null ? String.join(", ", from) : "",
+                recipients != null ? String.join(", ", recipients) : "",
+                cc != null ? String.join(", ", cc) : "",
+                bcc != null ? String.join(", ", bcc) : "",
+                subject != null ? String.join(", ", subject) : "",
+                parameters != null && !parameters.isEmpty()
+                    ? parameters.entrySet().stream()
+                        .map(e -> String.format("%s: %s", e.getKey(), e.getValue()))
+                        .collect(Collectors.joining(", "))
+                    : ""
+                );
+    }
+
+    public void recipient(String to) {
+        this.recipients.add(to);
+    }
+
+    public void cc(String cc) {
+        this.cc.add(cc);
+    }
+
+    public void bcc(String bcc) {
+        this.bcc.add(bcc);
+    }
+
+}
+
+
+-------------
+
+
+package pa.com.globalbank.onboarding.utils.services.mail;
+
+import lombok.Builder;
+import lombok.Getter;
+
+@Getter
+@Builder
+public class Attachment {
+
+    private String name;
+    private String contentType;
+    private String data;
+
+}
+
+
+
+----------------
+
+package pa.com.globalbank.onboarding.utils.validations;
+
+import jakarta.validation.Constraint;
+import jakarta.validation.Payload;
+import pa.com.globalbank.onboarding.utils.Generated;
+
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+import java.lang.annotation.Target;
+
+@Generated
+@Constraint(validatedBy = RulesValidationImpl.class)
+@Target(ElementType.TYPE)
+@Retention(RetentionPolicy.RUNTIME)
+public @interface RulesValidation {
+
+    String message() default "Field {field} have invalid value";
+    Class<?>[] groups() default { };
+    Class<? extends Payload>[] payload() default { };
+
+}
+
+
+------
+
+package pa.com.globalbank.onboarding.utils.validations;
+
+import jakarta.validation.ConstraintValidator;
+import jakarta.validation.ConstraintValidatorContext;
+import org.hibernate.validator.internal.engine.constraintvalidation.ConstraintValidatorContextImpl;
+import pa.com.globalbank.onboarding.utils.Generated;
+
+import java.lang.reflect.Field;
+import java.util.LinkedHashMap;
+
+@Generated
+public class RulesValidationImpl implements ConstraintValidator<RulesValidation, Object> {
+
+    @Override
+    public boolean isValid(Object obj, ConstraintValidatorContext context) {
+        Field[] fields = obj.getClass().getDeclaredFields();
+        LinkedHashMap<String, String> rulesMap = new LinkedHashMap<>();
+
+        for (var field : fields) {
+            if (field.isAnnotationPresent(Validate.class)) {
+                Validate validate = field.getAnnotation(Validate.class);
+                rulesMap.put(field.getName(), validate.rule());
+            }
+        }
+
+        try {
+            Validator.validateRequest(obj, rulesMap);
+
+            return true;
+        } catch (Exception e) {
+            ((ConstraintValidatorContextImpl) context)
+                .addMessageParameter("field", e.getMessage()
+                    .replace("Field ", "")
+                    .replace(" have invalid value", ""));
+
+            return false;
+        }
+    }
+}
+
+
+-----
+
+package pa.com.globalbank.onboarding.utils.validations;
+
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+import java.lang.annotation.Target;
+
+@Retention(RetentionPolicy.RUNTIME)
+@Target(ElementType.FIELD)
+public @interface Validate {
+    String rule();
+}
+
+
+-----------
+
+
+package pa.com.globalbank.onboarding.utils.validations;
+
+import pa.com.globalbank.onboarding.utils.Generated;
+
+@Generated
+public class ValidationPattern {
+
+    private ValidationPattern() {
+    }
+
+    public static final String EMAIL = "^(?=.{1,64}@)[A-Za-z0-9_-]+(\\.[A-Za-z0-9_-]+)*@[^-]"
+        + "[A-Za-z0-9-]+(\\.[A-Za-z0-9-]+)*(\\.[A-Za-z]{2,})$";
+    public static final String PHONE = "^\\d{7}$|^\\d{3}-\\d{4}$";
+    public static final String CELLPHONE = "^6\\d{7}$|^6\\d{3}-\\d{4}$";
+    public static final String BOTH_PHONE = "^\\d{7}$|^6\\d{7}$|^\\d{3}-\\d{4}$|^6\\d{3}-\\d{4}$";
+    public static final String NAME = "[a-zA-Z\\s\\p{IsLatin}]+";
+    public static final String COMPANY_NAME = "[a-zA-Z0-9-,.&:\\s\\p{IsLatin}]+";
+
+    public static final String DATE = "^((2000|2400|2800|(19|2[0-9])(0[48]|[2468][048]|[13579][26]))"
+        + "-02-29)$|^(((19|2[0-9])[0-9]{2})-02-(0[1-9]|1[0-9]|2[0-8]))$|^(((19|2[0-9])[0-9]{2})-"
+        + "(0[13578]|10|12)-(0[1-9]|[12][0-9]|3[01]))$|^(((19|2[0-9])[0-9]{2})-(0[469]|11)-"
+        + "(0[1-9]|[12][0-9]|30))$";
+
+    public static final String ALPHANUMERIC = "[a-zA-Z0-9\\s\\p{IsLatin}\\(\\)]+";
+    public static final String TEXT = "[a-zA-Z\\s,\\p{IsLatin}\\(\\)]+";
+    public static final String CODE = "[a-zA-Z0-9_-]+";
+    public static final String TEXT_CODE = "[a-zA-Z]+";
+    public static final String NUMBER_CODE = "[0-9]+";
+    public static final String HEX = "\\p{XDigit}+";
+    public static final String URL = "^(https?)://[-a-zA-Z0-9+&@#/%?=~_|!:,.;]*[-a-zA-Z0-9+&@#/%=~_|]";
+    public static final String PATH = "^/[-a-zA-Z0-9+&@#/%=~_|]*$";
+    public static final String UUID = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$";
+    public static final String BASE64 = "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$";
+    public static final String IDENTIFICATION = "\\d{1,2}-\\d{1,4}-\\d{1,5}"
+            + "|\\d{1,2}-AV-\\d{1,4}-\\d{1,5}"
+            + "|PE-\\d{1,4}-\\d{1,5}"
+            + "|\\d{1,2}-PI-\\d{1,4}-\\d{1,5}"
+            + "|E-\\d{1,4}-\\d{1,6}"
+            + "|N-\\d{1,4}-\\d{1,5}"
+            + "|^[a-zA-Z0-9]{1,8}\\-?[a-zA-Z0-9]{0,7}$";
+
+    public static final String IPV4_PATTERN =
+            "^(([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])(\\.(?!$)|$)){4}$";
+
+}
+
+
+
+--------------
+
+
+package pa.com.globalbank.onboarding.utils.validations;
+
+import io.quarkus.logging.Log;
+import jakarta.enterprise.context.ApplicationScoped;
+import org.apache.commons.lang3.reflect.FieldUtils;
+import pa.com.globalbank.onboarding.utils.exceptions.BusinessException;
+import pa.com.globalbank.onboarding.utils.exceptions.ErrorCodes;
+import pa.com.globalbank.onboarding.utils.exceptions.ErrorServices;
+
+import java.lang.reflect.Field;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.Period;
+import java.time.ZoneId;
+import java.util.Arrays;
+import java.util.Date;
+import java.util.List;
+import java.util.Map;
+
+@ApplicationScoped
+public class Validator {
+
+    public static final String INVALID_REQUEST_VALUE = "Invalid request value ";
+    public static final String INVALID_DATE_VALUE = "Invalid date value ";
+    public static final String NUMERIC = "numeric";
+    public static final String INTEGER = "integer";
+
+    private Validator() {
+    }
+
+    public static void validateOrFail(String str, String pattern) {
+        validateOrFail(str, pattern, false);
+    }
+
+    public static void validateOrFail(String str, String pattern, boolean acceptNullOrEmpty) {
+        if (acceptNullOrEmpty && (str == null || str.isBlank())) return;
+
+        else if (!acceptNullOrEmpty && (str == null || str.isBlank())) {
+            Log.error("::: Bad request data, cannot accept null or blank value :::");
+
+            throw new BusinessException("Bad request data, cannot accept null or blank value.",
+                ErrorServices.BAD_REQUEST_DATA.name(), ErrorCodes.BAD_REQUEST_CODE);
+        }
+
+        if (!str.matches(pattern)) {
+            Log.errorf("::: Value %s validation failed with pattern %s :::", str, pattern);
+
+            throw new BusinessException(String.format("Value %s validation failed.", str),
+                ErrorServices.BAD_REQUEST_DATA.name(), ErrorCodes.BAD_REQUEST_CODE);
+        }
+    }
+
+    public static void notNullOrBlank(String value, String message) {
+        if (value == null || value.isBlank()) {
+            throw new BusinessException(message,
+                ErrorServices.BAD_REQUEST_DATA.name(), ErrorCodes.BAD_REQUEST_CODE);
+        }
+    }
+
+    public static void invalidField(String field) {
+        throw new BusinessException(String.format("Field %s have invalid value", field),
+            ErrorServices.BAD_REQUEST_DATA.name(), ErrorCodes.BAD_REQUEST_CODE);
+    }
+
+    public static Throwable throwInvalidField(String field) {
+        return new BusinessException(String.format("Field %s have invalid value", field),
+            ErrorServices.BAD_REQUEST_DATA.name(), ErrorCodes.BAD_REQUEST_CODE);
+    }
+
+    public static void ageRange(Date birthday, int minAge, int maxAge) {
+        LocalDate to = birthday
+            .toInstant()
+            .atZone(ZoneId.systemDefault())
+            .toLocalDate();
+
+        ageRange(to, minAge, maxAge);
+    }
+
+    public static void ageRange(LocalDate birthday, int minAge, int maxAge) {
+        var years = Period.between(birthday, LocalDate.now()).getYears();
+
+        if (years < minAge || years > maxAge) {
+            throw new BusinessException("Invalid birthday.",
+                ErrorServices.BAD_REQUEST_DATA.name(), ErrorCodes.BAD_REQUEST_CODE);
+        }
+    }
+
+    public static void inValue(String value, List<String> acceptedValues) {
+        if (!acceptedValues.contains(value)) {
+            throw new BusinessException(INVALID_REQUEST_VALUE + value,
+                ErrorServices.BAD_REQUEST_DATA.name(), ErrorCodes.BAD_REQUEST_CODE);
+        }
+    }
+
+    public static void inRange(int value, int min, int max) {
+        if (value < min || value > max) {
+            throw new BusinessException(INVALID_REQUEST_VALUE + value,
+                ErrorServices.BAD_REQUEST_DATA.name(), ErrorCodes.BAD_REQUEST_CODE);
+        }
+    }
+
+    public static void inRange(double value, double min, double max) {
+        if (value < min || value > max) {
+            throw new BusinessException(INVALID_REQUEST_VALUE + value,
+                ErrorServices.BAD_REQUEST_DATA.name(), ErrorCodes.BAD_REQUEST_CODE);
+        }
+    }
+
+    public static void inRange(Date date, Date min, Date max) {
+        if (date.before(min) || date.after(max)) {
+            throw new BusinessException(INVALID_DATE_VALUE + date,
+                ErrorServices.BAD_REQUEST_DATA.name(), ErrorCodes.BAD_REQUEST_CODE);
+        }
+    }
+
+    public static void inRange(LocalDate date, LocalDate min, LocalDate max) {
+        if (date.isBefore(min) || date.isAfter(max)) {
+            throw new BusinessException(INVALID_DATE_VALUE + date,
+                ErrorServices.BAD_REQUEST_DATA.name(), ErrorCodes.BAD_REQUEST_CODE);
+        }
+    }
+
+    public static void inRange(LocalDateTime date, LocalDateTime min, LocalDateTime max) {
+        if (date.isBefore(min) || date.isAfter(max)) {
+            throw new BusinessException(INVALID_DATE_VALUE + date,
+                ErrorServices.BAD_REQUEST_DATA.name(), ErrorCodes.BAD_REQUEST_CODE);
+        }
+    }
+
+    public static void validateRequest(Object request, Map<String, String> rulesMap) {
+        for (Map.Entry<String, String> entry : rulesMap.entrySet()) {
+            String field = entry.getKey();
+
+            List<String> rules = Arrays.stream(entry.getValue().split("\\|")).toList();
+            Object value = getFieldValueByFieldName(field, request);
+
+            for (var rule : rules) {
+                if (
+                    (rule.equals("nullable") && value == null)
+                        || (rule.equals("blank") && value != null && value.toString().isBlank())
+                        || (rule.startsWith("requiredIf:") && checkRequiredIfRule(request, field, rule, value))
+                ) {
+                    break;
+                }
+
+                checkRulesBlock1(field, rule, rules, value);
+                checkRulesBlock2(field, rule, value);
+            }
+        }
+    }
+
+    private static String getValue(Object value) {
+        return value == null ? "" : value.toString();
+    }
+
+    private static void checkRulesBlock1(String field, String rule, List<String> rules, Object value) {
+        if (
+            rule.equals("required")
+                && (value == null || (value instanceof String && value.toString().isBlank()))
+        ) {
+            invalidField(field);
+        }
+
+        if (rule.equals(INTEGER)
+            && !getValue(value).matches("-?\\d+")) {
+            invalidField(field);
+        }
+
+        if (rule.equals(NUMERIC)
+            && !isNumeric(getValue(value))) {
+            invalidField(field);
+        }
+
+        if (rule.startsWith("min:")) {
+            checkMinRule(field, rules, rule, getValue(value));
+        }
+
+        if (rule.startsWith("max:")) {
+            checkMaxRule(field, rules, rule, getValue(value));
+        }
+    }
+
+    private static void checkRulesBlock2(String field, String rule, Object value) {
+        if (rule.startsWith("regex:")) {
+            checkRegExprRule(field, rule.split(":")[1], getValue(value));
+        }
+
+        if (rule.startsWith("in:")) {
+            checkInRule(field, rule, getValue(value));
+        }
+
+        if (rule.startsWith("notIn:")) {
+            checkNotInRule(field, rule, getValue(value));
+        }
+
+        if (rule.startsWith("ifIntegerMustBeOnRange:")
+            && getValue(value).matches("-?\\d+")) {
+            checkIfIntegerMustBeOnRange(field, rule, getValue(value));
+        }
+    }
+
+    private static void checkInRule(String field, String rule, String value) {
+        var temp = rule.split(":")[1];
+        var possibleValues = Arrays.stream(temp.split(",")).toList();
+
+        if (possibleValues.stream().noneMatch(value::equalsIgnoreCase)) {
+            invalidField(field);
+        }
+    }
+
+    private static void checkMinRule(String field, List<String> rules, String rule, String value) {
+        var min = Double.parseDouble(rule.split(":")[1]);
+
+        if (rules.contains(INTEGER) || rules.contains(NUMERIC)) {
+            var num = Double.parseDouble(value);
+
+            if (num < min) {
+                invalidField(field);
+            }
+        } else if (value.length() < min) {
+            invalidField(field);
+        }
+    }
+
+    private static void checkMaxRule(String field, List<String> rules, String rule, String value) {
+        var max = Double.parseDouble(rule.split(":")[1]);
+
+        if (rules.contains(INTEGER) || rules.contains(NUMERIC)) {
+            var num = Double.parseDouble(value);
+
+            if (num > max) {
+                invalidField(field);
+            }
+        } else if (value.length() > max) {
+            invalidField(field);
+        }
+    }
+
+    private static void checkNotInRule(String field, String rule, String value) {
+        var temp = rule.split(":")[1];
+        var possibleValues = Arrays.stream(temp.split(",")).toList();
+
+        if (possibleValues.stream().anyMatch(value::equalsIgnoreCase)) {
+            invalidField(field);
+        }
+    }
+
+    private static void checkIfIntegerMustBeOnRange(String field, String rule, String value) {
+        var temp = rule.split(":")[1].split(",");
+
+        var min = Integer.parseInt(temp[0]);
+        var max = Integer.parseInt(temp[1]);
+        var num = Integer.parseInt(value);
+
+        if (num < min || num > max) {
+            invalidField(field);
+        }
+    }
+
+    private static boolean checkRequiredIfRule(Object request, String field, String rule, Object value) {
+        var shouldBreak = false;
+        var temp = rule.split(":")[1].split(";");
+
+        var anotherField = temp[0];
+        var anotherFieldRequiredValue = Arrays.stream(temp[1].split(",")).toList();
+
+        var anotherFieldValue = getFieldValueByFieldName(anotherField, request);
+
+        if (anotherFieldValue == null
+            && anotherFieldRequiredValue.get(0).equalsIgnoreCase("null")
+            && value == null) {
+            invalidField(field);
+        } else if (anotherFieldRequiredValue.stream()
+            .anyMatch(anotherFieldValue.toString()::equalsIgnoreCase)
+            && (value == null || value.toString().isBlank())) {
+            invalidField(field);
+        } else if (anotherFieldRequiredValue.stream()
+            .noneMatch(anotherFieldValue.toString()::equalsIgnoreCase)
+            && (value == null || value.toString().isBlank())) {
+            shouldBreak = true;
+            // no es requerido y es nulo o vacio por lo que las validaciones
+            // siguientes no se deben realizar.
+        } else if (anotherFieldRequiredValue.stream()
+            .noneMatch(anotherFieldValue.toString()::equalsIgnoreCase)
+            && (value != null && !value.toString().isBlank())) {
+            invalidField(field);
+            // no es requerido, pero esta mandado valor asi que error
+        }
+
+        return shouldBreak;
+    }
+
+    private static void checkRegExprRule(String field, String regex, String string) {
+        var regexExpression = switch (regex) {
+            case "email" -> ValidationPattern.EMAIL;
+            case "phone" -> ValidationPattern.PHONE;
+            case "cellphone" -> ValidationPattern.CELLPHONE;
+            case "phoneOrCellphone" -> ValidationPattern.BOTH_PHONE;
+            case "name" -> ValidationPattern.NAME;
+            case "companyName" -> ValidationPattern.COMPANY_NAME;
+            case "alphanumeric" -> ValidationPattern.ALPHANUMERIC;
+            case "text" -> ValidationPattern.TEXT;
+            case "code" -> ValidationPattern.CODE;
+            case "textCode" -> ValidationPattern.TEXT_CODE;
+            case "numberCode" -> ValidationPattern.NUMBER_CODE;
+            case "hex" -> ValidationPattern.HEX;
+            case "url" -> ValidationPattern.URL;
+            case "path" -> ValidationPattern.PATH;
+            case "uuid" -> ValidationPattern.UUID;
+            case "base64" -> ValidationPattern.BASE64;
+            case "identification" -> ValidationPattern.IDENTIFICATION;
+            case "ip" -> ValidationPattern.IPV4_PATTERN;
+            default -> null;
+        };
+
+        if (regexExpression != null && !string.matches(regexExpression)) {
+            invalidField(field);
+        }
+    }
+
+    public static boolean isNumeric(Object value) {
+        try {
+            Double.parseDouble(value.toString());
+            return true;
+        } catch (NumberFormatException e) {
+            return false;
+        }
+    }
+
+    private static Object getFieldValueByFieldName(String fieldName, Object object) {
+        try {
+            Field field = FieldUtils.getField(object.getClass(), fieldName, true);
+
+            return field.get(object);
+        } catch (Exception e) {
+            return new RuntimeException(e);
+        }
+    }
+}
+
+
+-------------
+
+package pa.com.globalbank.onboarding.utils;
+
+import java.lang.annotation.Documented;
+import java.lang.annotation.Retention;
+import java.lang.annotation.Target;
+
+import static java.lang.annotation.ElementType.CONSTRUCTOR;
+import static java.lang.annotation.ElementType.METHOD;
+import static java.lang.annotation.ElementType.TYPE;
+import static java.lang.annotation.RetentionPolicy.RUNTIME;
+
+@Documented
+@Retention(RUNTIME)
+@Target({TYPE, METHOD, CONSTRUCTOR})
+public @interface Generated {
+}
+
+
+-------------------
+
+ <dependency>
+      <groupId>com.microsoft.graph</groupId>
+      <artifactId>microsoft-graph</artifactId>
+      <version>6.8.0</version>
+    </dependency>
+    <dependency>
+      <groupId>com.azure</groupId>
+      <artifactId>azure-identity</artifactId>
+      <version>1.12.1</version>
+    </dependency>
+	
+public class EmailsTemplates {
+
+    @CheckedTemplate(requireTypeSafeExpressions = false)
+    public static class Templates {
+
+        public static native TemplateInstance accountCreated();
+		
+TemplateInstance templateInstance = null;
+            String templateName = email.getTemplate().toLowerCase()
+                .replaceAll("-", "")
+                .replaceAll(".html", "");
+
+            if (email.getParameters() == null) {
+                email.setParameters(new HashMap<>());
+            }
+			
+if ("accountCreated".toLowerCase().equals(templateName)) {
+                templateInstance = EmailsTemplates.Templates.accountCreated();
+            }
+			
+ email.getParameters().put("year", Year.now().getValue());
+ 
+ final var htmlBody = templateInstance.data(email.getParameters()).render();
+ 
+ private void sendMailGraphApi(EmailRequest emailRequest, String htmlBody) {
+        LOGGER.info("::: Sending Email using Graph Api :::");
+
+        if (clientSecretCredential == null) {
+            clientSecretCredential = new ClientSecretCredentialBuilder()
+                .clientId(config.getValue("azure.client-id", String.class))
+                .tenantId(config.getValue("azure.tenant-id", String.class))
+                .clientSecret(config.getValue("azure.secret", String.class))
+                .build();
+        }
+
+        //obteniendo token
+        if (graphServiceClient == null) {
+            graphServiceClient = new GraphServiceClient(
+                clientSecretCredential,
+                List.of(config.getValue("azure.scope", String.class)).toArray(String[]::new));
+        }
+
+        Message message = new Message();
+
+        message.setFrom(createRecipientList(List.of(emailRequest.getFrom())).get(0));
+
+        // subject
+        message.setSubject(emailRequest.getSubject());
+
+        // body
+        ItemBody body = new ItemBody();
+        body.setContentType(BodyType.Html);
+        body.setContent(htmlBody);
+        message.setBody(body);
+
+        // destinatarios
+        message.setToRecipients(createRecipientList(emailRequest.getRecipients()));
+        // cc
+        message.setCcRecipients(createRecipientList(emailRequest.getCc()));
+        // bcc
+        message.setBccRecipients(createRecipientList(emailRequest.getBcc()));
+
+        // attachments
+        if (emailRequest.getAttachments() != null && !emailRequest.getAttachments().isEmpty()) {
+            Base64 base64 = new Base64();
+            List<Attachment> attachmentsList = new ArrayList<>();
+
+            for (var attachment : emailRequest.getAttachments()) {
+                FileAttachment fileAttachment = new FileAttachment();
+
+                fileAttachment.setName(attachment.getName());
+                fileAttachment.setContentType(attachment.getContentType());
+                fileAttachment.setOdataType("#microsoft.graph.fileAttachment");
+                fileAttachment.setIsInline(false);
+                fileAttachment.setContentBytes(base64.decode(attachment.getData()));
+
+                attachmentsList.add(fileAttachment);
+            }
+
+            // NOSONAR
+            message.setAttachments(attachmentsList);
+        }
+
+        var sendMailPostRequestBody = new SendMailPostRequestBody();
+
+        sendMailPostRequestBody.setMessage(message);
+        sendMailPostRequestBody.setSaveToSentItems(false);
+
+        graphServiceClient
+            .users()
+            .byUserId(emailRequest.getFrom())
+            .sendMail()
+            .post(sendMailPostRequestBody);
+    }
+
+    private List<Recipient> createRecipientList(List<String> emails) {
+        List<Recipient> recipientsList = new ArrayList<>();
+
+        if (emails != null && !emails.isEmpty()) {
+            for (String email : emails) {
+                Recipient recipient = new Recipient();
+
+                EmailAddress emailAddress = new EmailAddress();
+                emailAddress.setAddress(email);
+
+                recipient.setEmailAddress(emailAddress);
+
+                recipientsList.add(recipient);
+            }
+        }
+
+        return recipientsList;
+    }
+-----------------------	
+public String sendSms(String toNumber, String textMessage) {
+        try {
+            Twilio.init(twilioAccountId, twilioAuthToken);
+
+            Message message = Message
+                .creator(
+                    new PhoneNumber(toNumber),
+                    new PhoneNumber(twilioSender),
+                    textMessage)
+                .create();
+
+            return message.getSid();
+        } catch (ApiException e) {
+            Log.errorf("::: FAILED TO SEND SMS ::: %s", e.getMessage());
+
+            throw new BusinessException(ErrorCodes.REST_CLIENT_MSG,
+                ErrorServices.REST_CLIENT.name(), ErrorCodes.REST_CLIENT_MSG);
+        }
+    }
+-------------------
+private String generateOtpCode() {
+        return new DecimalFormat(FORMAT).format(new SecureRandom().nextInt(999999));
+    }
+	--------------
+	
+package pa.com.globalbank.onboarding.otp.usecases.validate;
+
+import io.quarkus.logging.Log;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
+import jakarta.ws.rs.core.Response;
+import org.eclipse.microprofile.rest.client.inject.RestClient;
+import pa.com.globalbank.onboarding.otp.exceptions.CustomErrorServices;
+import pa.com.globalbank.onboarding.otp.restclient.SecurityClient;
+import pa.com.globalbank.onboarding.otp.restclient.dtos.EncryptDecryptInput;
+import pa.com.globalbank.onboarding.otp.usecases.validate.dtos.OtpValidationRequest;
+import pa.com.globalbank.onboarding.otp.usecases.validate.dtos.OtpValidationResponse;
+import pa.com.globalbank.onboarding.utils.beans.JsonProvider;
+import pa.com.globalbank.onboarding.utils.exceptions.BusinessException;
+import pa.com.globalbank.onboarding.utils.exceptions.ErrorCodes;
+import pa.com.globalbank.onboarding.utils.exceptions.ErrorServices;
+import pa.com.globalbank.onboarding.utils.repository.common.otp.OtpRepository;
+import pa.com.globalbank.onboarding.utils.repository.common.otp.entities.Otp;
+import java.time.LocalDateTime;
+import java.util.Comparator;
+import java.util.Objects;
+
+import static pa.com.globalbank.onboarding.otp.exceptions.CustomErrorCodes.EXPIRED_OTP_CODE;
+import static pa.com.globalbank.onboarding.otp.exceptions.CustomErrorCodes.INACTIVE_OTP_CODE;
+import static pa.com.globalbank.onboarding.otp.exceptions.CustomErrorCodes.INVALID_OTP_CODE;
+import static pa.com.globalbank.onboarding.otp.exceptions.CustomErrorCodes.OTP_RETRY_COUNT_REACHED;
+
+@ApplicationScoped
+public class OtpValidationUseCase {
+
+    private final OtpRepository otpRepository;
+
+    private final  JsonProvider json;
+
+    private final SecurityClient securityClient;
+
+    @Inject
+    public OtpValidationUseCase(OtpRepository otpRepository, JsonProvider json,
+                                @RestClient SecurityClient securityClient) {
+        this.otpRepository = otpRepository;
+        this.json = json;
+        this.securityClient = securityClient;
+    }
+
+    public OtpValidationResponse execute(OtpValidationRequest request)
+        throws BusinessException {
+
+        Log.infof("::: FINDING OTP CODE WITH EMAIL ::: {%s}", json.toJSONUnPretty(request));
+
+        Otp otp;
+
+        if (request.getEmail() != null && !request.getEmail().isBlank()) {
+            var allOtp = otpRepository.findByEmailList(request.getEmail());
+
+            otp = allOtp.stream()
+                .max(Comparator.comparing(Otp::getExpirationDate))
+                .orElseThrow(() -> new BusinessException(
+                    ErrorCodes.RESOURCE_NOT_FOUND_MSG,
+                    ErrorServices.RECORD.name(),
+                    ErrorCodes.RESOURCE_NOT_FOUND_CODE
+                ));
+        } else if (request.getCellphone() != null && !request.getCellphone().isBlank()) {
+            var allOtp = otpRepository.findByCellphoneList(request.getCellphone());
+
+            otp = allOtp.stream()
+                .max(Comparator.comparing(Otp::getExpirationDate))
+                .orElseThrow(() -> new BusinessException(
+                    ErrorCodes.RESOURCE_NOT_FOUND_MSG,
+                    ErrorServices.RECORD.name(),
+                    ErrorCodes.RESOURCE_NOT_FOUND_CODE
+                ));
+        } else {
+            throw new BusinessException("Se ha superado la cantidad de intentos",
+                CustomErrorServices.VALIDATION.name(), OTP_RETRY_COUNT_REACHED);
+        }
+
+        otp.setRetryCounter(otp.getRetryCounter() + 1);
+        otpRepository.saveOtpCode(otp);
+
+        if (otp.getRetryCounter() > 3) {
+            throw new BusinessException("Se ha superado la cantidad de intentos",
+                CustomErrorServices.VALIDATION.name(), OTP_RETRY_COUNT_REACHED);
+        }
+
+        validateOtp(otp, request.getOtpCode());
+
+        otp.setActive(false);
+        otp.setUseDate(LocalDateTime.now());
+
+        Log.info("::: SAVING OTP CODE :::");
+        otpRepository.saveOtpCode(otp);
+
+        Log.info("::: VALIDATE OTP SERVICE HAS FINISHED :::");
+
+        return OtpValidationResponse.builder()
+            .status(String.valueOf(Response.Status.OK.getStatusCode()))
+            .valid(true)
+            .message("Verificación exitosa").build();
+    }
+
+    private void validateOtp(Otp otp, String plainOtp) {
+        String code = null;
+        String message = null;
+
+        String decryptedOtp = securityClient.decrypt(EncryptDecryptInput.builder()
+            .value(otp.getCode())
+            .build());
+
+        Log.infof("::: VALIDATING OTP CODE ::: {%s}", plainOtp);
+
+        if (!decryptedOtp.equalsIgnoreCase(plainOtp)) {
+            code = INVALID_OTP_CODE;
+            message = "El código ingresado no corresponde al código enviado al correo";
+        } else if (!otp.isActive()) {
+            code = INACTIVE_OTP_CODE;
+            message = "El código ya ha sido utilizado";
+        } else if (otp.getExpirationDate().isBefore(LocalDateTime.now())) {
+            code = EXPIRED_OTP_CODE;
+            message = "El código ha vencido";
+        }
+
+        if (Objects.nonNull(code)) {
+            throw new BusinessException(message, CustomErrorServices.VALIDATION.name(), code);
+        }
+    }
+}
+
+--------------
+
+package pa.com.globalbank.onboarding.backoffice.commons;
+
+import io.quarkus.logging.Log;
+import org.apache.commons.io.FilenameUtils;
+import org.jboss.resteasy.reactive.multipart.FileUpload;
+import pa.com.globalbank.onboarding.backoffice.exceptions.CustomErrorCodes;
+import pa.com.globalbank.onboarding.backoffice.usecases.dtos.UploadFileResponse;
+import pa.com.globalbank.onboarding.utils.exceptions.BusinessException;
+import pa.com.globalbank.onboarding.utils.exceptions.ErrorServices;
+import pa.com.globalbank.onboarding.utils.services.document.CosmosDocumentUtils;
+
+import javax.imageio.ImageIO;
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.Map;
+
+public class FileExtensions {
+
+    public static final String APPLICATION_PDF = "application/pdf";
+    public static final String IMAGE_PNG = "image/png";
+    public static final String IMAGE_JPEG = "image/jpeg";
+    public static final String INVALID_FILE_TYPE = "Invalid file type";
+
+    private FileExtensions() {}
+
+    private static String getFileName(FileUpload request, String documentNumber,
+                                     String fileNamePattern) {
+        return fileNamePattern.concat("-")
+            .concat(documentNumber == null ? "" : documentNumber)
+            .concat(getExtension(request));
+    }
+
+    private static String getExtension(FileUpload request) {
+        return switch (request.contentType().toLowerCase()) {
+            case APPLICATION_PDF -> ".pdf";
+            case IMAGE_PNG -> ".png";
+            case IMAGE_JPEG -> ".jpeg";
+            default -> " Extension invalida";
+        };
+    }
+
+    private static Map<String, String> getMetaData(FileUpload request, String documentNumber, String documentType) {
+        Map<String, String> meta = new HashMap<>();
+        meta.put("_contentType", request.contentType().toLowerCase());
+        meta.put("documentNumber", documentNumber);
+        meta.put("documentType", documentType);
+        return meta;
+    }
+
+    public static void checkFileType(String contentType, String filename) {
+        var validContentTypes = Arrays.asList(IMAGE_PNG, IMAGE_JPEG, APPLICATION_PDF);
+        var validExtensions = Arrays.asList("pdf", "jpg", "jpeg", "png");
+
+        if (!validContentTypes.contains(contentType.toLowerCase())) {
+            throw new BusinessException(INVALID_FILE_TYPE, ErrorServices.RECORD.name(),
+                CustomErrorCodes.INVALID_FILE);
+        }
+
+        if (!validExtensions.contains(FilenameUtils.getExtension(filename).toLowerCase())) {
+            throw new BusinessException(INVALID_FILE_TYPE, ErrorServices.RECORD.name(),
+                CustomErrorCodes.INVALID_FILE);
+        }
+    }
+
+    public static void checkIsPdfFile(byte[] data) {
+        // valida si empieza con %PDF
+        if (data != null && data.length > 4
+            && data[0] == 0x25 // %
+            && data[1] == 0x50 // P
+            && data[2] == 0x44 // D
+            && data[3] == 0x46 // F
+            && data[4] == 0x2D) { // -
+
+            return;
+        }
+
+        Log.error("::: Invalid pdf file :::");
+
+        throw new BusinessException(INVALID_FILE_TYPE, ErrorServices.RECORD.name(),
+            CustomErrorCodes.INVALID_FILE);
+    }
+
+    public static void checkIsImageFile(byte[] data) {
+        try {
+            if (ImageIO.read(new ByteArrayInputStream(data)) == null) {
+                throw new IOException("Invalid image file");
+            }
+        } catch (IOException e) {
+            Log.errorf("::: Invalid image file ::: %s", e.getMessage());
+
+            throw new BusinessException(INVALID_FILE_TYPE, ErrorServices.RECORD.name(),
+                CustomErrorCodes.INVALID_FILE);
+        }
+    }
+
+    public static void checkSizeInMegaBytes(long fileSize) {
+        int maxBytes = (int) ((double) 2 * 1000000);
+        if (maxBytes < fileSize || fileSize == 0) {
+            throw new BusinessException(INVALID_FILE_TYPE, ErrorServices.RECORD.name(),
+                CustomErrorCodes.INVALID_FILE);
+        }
+    }
+
+    public static UploadFileResponse saveDocument(CosmosDocumentUtils cosmosDocumentUtils,
+                                      String bdName,
+                                      String documentType,
+                                      String documentNumber,
+                                      FileUpload fileUpload,
+                                      String fileNamePattern) throws IOException {
+        checkSizeInMegaBytes(fileUpload.size());
+        checkFileType(fileUpload.contentType(), fileUpload.fileName());
+
+        byte[] content = Files.readAllBytes(fileUpload.uploadedFile());
+
+        if (fileUpload.contentType().equalsIgnoreCase(APPLICATION_PDF)) {
+            checkIsPdfFile(content);
+        } else {
+            checkIsImageFile(content);
+        }
+
+        String filename = getFileName(fileUpload, documentNumber, fileNamePattern);
+
+        var docId = cosmosDocumentUtils
+            .saveDocument(bdName, filename,
+                getMetaData(fileUpload, documentNumber, documentType), content);
+
+        return UploadFileResponse.builder()
+            .id(docId)
+            .fileSize(fileUpload.size())
+            .filename(filename)
+            .build();
+    }
+
+}
+
+----------------
+
+<dependency>
+      <groupId>com.azure</groupId>
+      <artifactId>azure-identity</artifactId>
+      <version>1.11.1</version>
+    </dependency>
+    <dependency>
+      <groupId>com.microsoft.graph</groupId>
+      <artifactId>microsoft-graph</artifactId>
+      <version>5.80.0</version>
+    </dependency>
+	
+----------------------
+
+Response.ResponseBuilder response = Response.ok(Base64.decodeBase64(fileContent.getContent()));
+
+        response.header("Content-Type",  fileContent.getContentType());
+        response.header("Content-Disposition", "attachment;filename=" + fileContent.getFilename());
+
+        return response.build();
+		
+------------------
+
+package pa.com.globalbank.onboarding.backoffice.usecases;
+
+import io.quarkus.logging.Log;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
+import org.eclipse.microprofile.config.inject.ConfigProperty;
+import pa.com.globalbank.onboarding.backoffice.services.azure.dtos.User;
+import pa.com.globalbank.onboarding.backoffice.usecases.dtos.GetCreditAnalystResponse;
+import pa.com.globalbank.onboarding.backoffice.services.azure.AzureActiveDirectoryService;
+
+import java.util.List;
+
+@ApplicationScoped
+public class GetCreditAnalystsUseCase {
+
+    @ConfigProperty(name = "groups.analyst")
+    String analystGroupId;
+
+    private final GetProductCountUseCase getProductCountUseCase;
+
+    private final AzureActiveDirectoryService azureActiveDirectoryService;
+
+    @Inject
+    public GetCreditAnalystsUseCase(GetProductCountUseCase getProductCountUseCase,
+                                    AzureActiveDirectoryService azureActiveDirectoryService) {
+        this.getProductCountUseCase = getProductCountUseCase;
+        this.azureActiveDirectoryService = azureActiveDirectoryService;
+    }
+
+    public GetCreditAnalystResponse execute() {
+        Log.infof("::: GetCreditAnalystsUseCase INIT ::: %s", analystGroupId);
+
+        var users = azureActiveDirectoryService.getUserByGroupId(analystGroupId).stream()
+            .filter(u -> u.getEmail() != null && !u.getEmail().isBlank())
+            .toList();
+
+        return GetCreditAnalystResponse.builder()
+            .users(users)
+            .build();
+    }
+
+    public List<User> getAnalystsWithRequestNumber() {
+        Log.infof("::: GetCreditAnalystsUseCase INIT with request number ::: %s", analystGroupId);
+
+        var users = execute().getUsers();
+
+        getProductCountUseCase.getProductCountForUsers(users);
+
+        return users;
+    }
+
+}
+
+---------------
+
+package pa.com.globalbank.onboarding.backoffice.services.azure;
+
+import com.azure.identity.ClientSecretCredential;
+import com.azure.identity.ClientSecretCredentialBuilder;
+import com.microsoft.graph.authentication.TokenCredentialAuthProvider;
+import com.microsoft.graph.models.DirectoryObject;
+import com.microsoft.graph.requests.GraphServiceClient;
+import jakarta.enterprise.context.ApplicationScoped;
+import okhttp3.Request;
+import org.eclipse.microprofile.config.inject.ConfigProperty;
+import pa.com.globalbank.onboarding.backoffice.services.azure.dtos.User;
+import pa.com.globalbank.onboarding.utils.Generated;
+
+import java.util.ArrayList;
+import java.util.List;
+
+@Generated
+@ApplicationScoped
+public class AzureActiveDirectoryService {
+
+    @ConfigProperty(name = "active-directory.client-id")
+    String clientId;
+
+    @ConfigProperty(name = "active-directory.client-secret")
+    String clientSecret;
+
+    @ConfigProperty(name = "active-directory.tenant-id")
+    String tenant;
+
+    @ConfigProperty(name = "active-directory.scope")
+    String scope;
+
+    public List<User> getUserByGroupId(String groupId) {
+        final ClientSecretCredential clientSecretCredential = new ClientSecretCredentialBuilder()
+            .clientId(clientId)
+            .clientSecret(clientSecret)
+            .tenantId(tenant)
+            .build();
+
+        final TokenCredentialAuthProvider
+            tokenCredentialAuthProvider = new TokenCredentialAuthProvider(List.of(scope), clientSecretCredential);
+
+        final GraphServiceClient<Request> graphClient =
+            GraphServiceClient
+                .builder()
+                .authenticationProvider(tokenCredentialAuthProvider)
+                .buildClient();
+
+        var membersRequest = graphClient.groups(groupId).members();
+        var members = membersRequest.buildRequest().get();
+        var users = members.getCurrentPage();
+
+        List<User> list = new ArrayList<>();
+        for (DirectoryObject u : users) {
+            User user = mapUser((com.microsoft.graph.models.User) u);
+            list.add(user);
+        }
+        return list;
+    }
+
+    private User mapUser(com.microsoft.graph.models.User u) {
+        return User.builder()
+            .id(u.id)
+            .email(u.mail != null ? u.mail.toLowerCase() : null)
+            .givenName(u.givenName)
+            .surname(u.surname)
+            .displayName(u.displayName)
+            .build();
+    }
+}
+
+-----------------------
+
+
+<dependency>
+      <groupId>org.apache.poi</groupId>
+      <artifactId>poi</artifactId>
+      <version>${org.apache.poi.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.poi</groupId>
+      <artifactId>poi-ooxml</artifactId>
+      <version>${org.apache.poi.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.quarkus</groupId>
+      <artifactId>quarkus-resteasy-reactive-qute</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>com.openhtmltopdf</groupId>
+      <artifactId>openhtmltopdf-core</artifactId>
+      <version>${openhtml.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>com.openhtmltopdf</groupId>
+      <artifactId>openhtmltopdf-java2d</artifactId>
+      <version>${openhtml.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>com.openhtmltopdf</groupId>
+      <artifactId>openhtmltopdf-pdfbox</artifactId>
+      <version>${openhtml.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>com.github.librepdf</groupId>
+      <artifactId>openpdf</artifactId>
+      <version>2.0.2</version>
+    </dependency>
+	
+	--------------
+	
+templates.DocumentTemplate
+
+package pa.com.globalbank.onboarding.document.service.document;
+
+import com.openhtmltopdf.pdfboxout.PdfRendererBuilder;
+import com.openhtmltopdf.util.XRLog;
+import io.quarkus.logging.Log;
+import io.quarkus.qute.TemplateInstance;
+import io.vertx.core.eventbus.EventBus;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
+import org.apache.commons.codec.binary.Base64;
+import org.eclipse.microprofile.config.inject.ConfigProperty;
+import pa.com.globalbank.onboarding.document.dtos.loan.PdfGenerationRequest;
+import pa.com.globalbank.onboarding.document.exceptions.CustomErrorCodes;
+import pa.com.globalbank.onboarding.document.exceptions.CustomErrorServices;
+import pa.com.globalbank.onboarding.utils.beans.JsonProvider;
+import pa.com.globalbank.onboarding.utils.events.QueueMessage;
+import pa.com.globalbank.onboarding.utils.exceptions.BusinessException;
+
+import java.io.ByteArrayOutputStream;
+import java.util.Map;
+import java.util.logging.Level;
+
+import static pa.com.globalbank.onboarding.document.common.PDFConstants.*;
+
+@ApplicationScoped
+public class DocumentFactory {
+
+    @Inject
+    JsonProvider jsonProvider;
+
+    @Inject
+    EventBus bus;
+
+    @ConfigProperty(name = "azure-service-bus.queues-name.document")
+    String destination;
+
+    @ConfigProperty(name = "templates.images")
+    String templateImages;
+
+    public String generateDocument(String template, Map<String, Object> data) {
+        Log.infof("::: GENERATING PDF DOCUMENT ::: %s - %s", template, jsonProvider.toJSONUnPretty(data));
+
+        TemplateInstance templateInstance = switch (template) {
+            // Cuentas de Ahorros
+            case CA_TEMPLATE_TYC -> DocumentTemplates.Templates.accountTycV1();
+            case CA_TEMPLATE_TYC_BANK_EMPLOYEE -> DocumentTemplates.Templates.accountTycBankEmployeeV1();
+            case CA_TEMPLATE_BENEFICIARIES -> DocumentTemplates.Templates.accountBeneficiariesV1();
+            case CA_TEMPLATE_UPDATE_INFO_WITH_MARRIED_LASTNAME -> DocumentTemplates.Templates
+                .accountUpdateInfoWithMarriedLastnameV1();
+
+            case CA_TEMPLATE_UPDATE_INFO_WITHOUT_MARRIED_LASTNAME -> DocumentTemplates.Templates
+                .accountUpdateInfoWithoutMarriedLastnameV1();
+
+            // Prestamos Personales
+            case PP_TEMPLATE_LIEN_INSURANCE -> DocumentTemplates.Templates.loanLienInsuranceV1();
+            case PP_TEMPLATE_INSURABILITY_BEFORE_AGE -> DocumentTemplates.Templates.loanInsurabilityBeforeAgeV1();
+            case PP_TEMPLATE_INSURABILITY_AFTER_AGE -> DocumentTemplates.Templates.loanInsurabilityAfterAgeV1();
+            case PP_TEMPLATE_PROMISSORY_NOTE -> DocumentTemplates.Templates.loanPromissoryNoteV1();
+            case PP_TEMPLATE_UPDATE_INFO -> DocumentTemplates.Templates.loanUpdateInfoV1();
+            case PP_TEMPLATE_LOAN_SUMMARY -> DocumentTemplates.Templates.loanSummaryV2();
+            case TEMPLATE_APC -> DocumentTemplates.Templates.apcReferencesV1();
+
+            //Prestamo de autos
+            case AUTO_TEMPLATE_ACCEPTANCE -> DocumentTemplates.Templates.autosAcceptanceSummary();
+            case AUTO_TEMPLATE_ESCROW_CONTRACT -> DocumentTemplates.Templates.autoEscrowContract();
+            case AUTO_TEMPLATE_LIEN_INSURANCE -> DocumentTemplates.Templates.loanAutoLienInsurance();
+            case VEHICLE_LOAN_PROMISSORY_NOTE -> DocumentTemplates.Templates.loanVehiclePromissoryNote();
+            case AUTO_MUNICIPALITY_LETTER -> DocumentTemplates.Templates.autoMunicipalituLetter();
+            case AUTO_TEMPLATE_PAYMENT_PROMISE -> DocumentTemplates.Templates.autoPaymentPromise();
+            case DOCUMENT_TRANSIT_LETTER_PDF -> DocumentTemplates.Templates.autoTransitLetter();
+
+            //Tarjetas de creditos
+            case TC_TEMPLATE_DIGITAL_CONTRACT -> DocumentTemplates.Templates.tcDigitalContract();
+            case TDC_CARD_INFORMATION -> DocumentTemplates.Templates.tdcCardInformation();
+            case TDC_ACCEPTANCE_SUMMARY -> DocumentTemplates.Templates.tdcAcceptanceSummary();
+
+            default -> null;
+        };
+
+        if (templateInstance == null) {
+            Log.errorf("::: NO TEMPLATE FOUND FOR DOCUMENT ::: %s", template);
+            throw new BusinessException("no template found", CustomErrorServices.GENERATION.name(),
+                CustomErrorCodes.PDF_DOCUMENT_GENERATION);
+        }
+
+        try {
+            XRLog.listRegisteredLoggers().forEach(logger -> XRLog.setLevel(logger, Level.WARNING));
+
+            // cargar imagenes para pasarlas como base64 a los templates.
+            var imageNames = templateImages.split(",");
+
+            for (var imageName : imageNames) {
+                byte[] imageData = this.getClass().getClassLoader()
+                    .getResourceAsStream("/images/" + imageName).readAllBytes();
+
+                String encodedString = Base64.encodeBase64String(imageData);
+                var temp = imageName.split("\\.");
+
+                data.put("image_" + temp[0], String.format("data:image/%s;base64, %s", temp[1], encodedString));
+            }
+
+            // asignar data al template y render html
+            data.forEach(templateInstance::data);
+            var html = templateInstance.render();
+
+            // se transforma el html a PDF
+            ByteArrayOutputStream os = new ByteArrayOutputStream();
+            PdfRendererBuilder builder = new PdfRendererBuilder();
+
+            builder.useFastMode();
+            builder.withHtmlContent(html, null);
+            builder.toStream(os);
+            builder.run();
+
+            Log.infof("::: DOCUMENT GENERATED ::: %s", template);
+
+            // se retorna como base64
+            Base64 base64 = new Base64();
+
+            return base64.encodeAsString(os.toByteArray());
+        } catch (Exception e) {
+            Log.errorf("::: ERROR GENERATING DOCUMENT ::: %s - %s - %s", template, e.getMessage(), e.getCause());
+
+            throw new BusinessException(e.getMessage(), CustomErrorServices.GENERATION.name(),
+                CustomErrorCodes.PDF_DOCUMENT_GENERATION);
+        }
+    }
+
+    public void reSendDocuments(PdfGenerationRequest request) throws BusinessException {
+        var message = jsonProvider.toJSON(request);
+        Log.infof("::: RE-SENDING DOCUMENTS QUEUE REQUEST ::: %s", message);
+        bus.send("queue-send-message", new QueueMessage(destination, message));
+    }
+}
+
+++++++++++++++++
+
+import dayjs from "dayjs";
+import winston from "winston";
+const { printf } = winston.format;
+
+const myFormat = printf(({ level, message }) => {
+  return `${dayjs().format()} [${level}] ${message}`;
+});
+
+const logger = winston.createLogger({
+  level: "info",
+  format: myFormat,
+  transports: [
+    new winston.transports.Console(),
+  ],
+});
+
+export { logger };
+
+
+----------------
+
+
+import { NextResponse } from 'next/server'
+import type { NextRequest } from 'next/server'
+import { MAINTENANCE_ERROR } from './lib/Exceptions';
+
+const isInMaintenanceMode = (process.env.MAINTENANCE_MODE || "0") === "1";
+
+// This function can be marked `async` if using `await` inside
+export function middleware(request: NextRequest) {
+  if (request.url.includes("/api") && isInMaintenanceMode) {
+    return NextResponse.json({
+      code: MAINTENANCE_ERROR,
+      message: "MaintenanceModeException"
+    }, { status: 503 });
+  } else if (isInMaintenanceMode) {
+    return NextResponse.redirect(new URL('/maintenance', request.url))
+  }
+
+  return NextResponse.next();
+}
+
+export const config = {
+  matcher: [
+    /*
+     * Match all request paths except for the ones starting with:
+     * - _next/static (static files)
+     * - _next/image (image optimization files)
+     * - favicon.ico (favicon file)
+     */
+    '/((?!maintenance|_next/static|_next/image|favicon.ico).*)',
+  ],
+}
+
+
+---------------
+
