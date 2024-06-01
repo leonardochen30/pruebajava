@@ -1,0 +1,662 @@
+# Instalación, Actualización o Rollback de Componente REST
+
+Esta guía ilustra la instalación de un componente REST para la plataforma API REST.
+
+> Se asumme que ya esta configurado el servidor y instalado el componente Administrator.
+
+> @Component es el nombre del componente a instalar. Ejemplo: Commons, BECA, etc.
+
+## Instalación:
+
+  - Subir los archivos correspondiente de la instalación al servidor:
+    - install-@Component.sh
+    - update.sh
+    - rollback.sh
+    - @Component<version>.zip
+    - @Component.service
+  - Darle permisos de ejecución a los scripts:
+    ```console
+    # chmod +x update.sh rollback.sh install-@Component.sh
+    ```
+  - Iniciar el instalador y siga los pasos indicados por el mismo:
+    ```console
+    # ./install-@Component.sh @Component<version>.zip
+    ```
+  - Ingresar al Administrador de Componentes API REST y en el menú Configuraciones / Modulos, registrar el componente instalado. Solo coloque el nombre del componente y deje los demás campos sugeridos.
+
+## Actualización:
+
+  > Se asume que ya se instalo este componente anteriormente.
+
+  - Subir el archivo zip de deployment @Component<version>.zip
+  - Mover el archivo de deployment al directorio */opt/GBREST/@Component* y cambiarse hacia alla
+    ```console
+    # mv @Component<version>.zip /opt/GBREST/@Component
+    # cd /opt/GBREST/@Component
+    ```
+  - ejecutar script de actualización con el nombre del deployment:
+    ```console
+    # ./update.sh @Component<version>.zip
+    ```
+
+## Rollback
+
+  > Debe exitir un deployment respaldado de alguna actualicación anterior.
+
+  - Cambiarse al directorio */opt/GBREST/@Component*
+    ```console
+    # cd /opt/GBREST/@Component
+    ```
+  - Ejecutar script del rollback.
+    ```console
+    # ./rollback.sh
+    ```
+-------------------------------------------------------------------
+
+### Guía de Troubleshooting
+
+Esta guia ofrece una lista de situaciones y como reaccionar a ellas para detectar problemas para los componentes API REST.
+
+1. El servicio no responde.
+
+   - Verificar que el servidor responda a PING.
+   - Verificar en el servidor si el servicio al componente esta levantado o corriendo:
+
+    > Nota: El gbadministrator solo corre en servidor con rol balanceador.
+
+    ```console
+    # ps -aufx | grep java
+    # systemctl status gbadministrator
+    # systemctl status gbbeca
+    # systemctl status gbbpm
+    # systemctl status gbcommons
+    ```
+   - En tal caso no esten levantados, arrancarlos:
+
+    ```console
+    # systemctl start gbadministrator
+    # systemctl start gbbeca
+    # systemctl start gbcommons
+    ```
+2. Los servicios responden con error:
+
+   - Verificar en el Administrador de componenentes REST en los logs por errores.
+   - Si no aparece error, verificar en los logs del servidor en la siguiente ruta: /opt/GBREST/<Modulo>/logs el archivo logs.log o el correspondiente por fecha.
+
+        > Donde <Modulo> puede ser GBCommons, GBBECA, GBBPM.
+
+3. Se necesita actualizar las credenciales de una conexión a Base de Datos
+
+   - Utilizar el programa Encriptador suministrado
+   - Ingresar la llave de encriptación del servidor
+
+        > La misma se puede ubicar en el archivo dentro del servidor /etc/systemd/gbrest.conf
+   - En valor a encriptar, colocar la contraseña de base de datos y el valor encriptado resultante se ingresa en el archivo de configuración /opt/GBREST/config.conf
+
+    > Recuerde que los nombres de servidor e instancia de base de datos se separa con un doble backslash \\\\.
+
+--------------------------------------------------
+
+# Configuración de Servidor Componentes API REST
+
+Esta guía refleja los pasos necesarios para la instalación y configuración de los componentes API REST.
+
+Esta guía asume que se instala sobre un servidor RedHat Enterprise Linux 8.3 utilizada por el banco.
+
+<br>
+
+
+> Se asume que el servidor entregado por Infraestructura TI es RedHat Enterprise Linux y se tiene los certificados digitales para el mismo.
+
+<br>
+
+# Instalar Java
+
+- Subir al servidor el archivo *OpenJDK17U-jre_x64_linux_hotspot_17.0.1_12.tar.gz* en */opt*.
+> El mismo se encuentra en el servidor de desarrollo SLVD-0046 en /home/leonardochen
+
+<br>
+
+> **Nota:** El mismo se encuentra en el servidor Linux de desarrollo *slvd-0046* en */opt*.
+
+<br>
+
+- Descomprimir el archivo:
+
+  ```console
+  # cd /opt
+  # mkdir java
+  # tar -xf OpenJDK17U-jre_x64_linux_hotspot_17.0.1_12.tar.gz
+  # mv jdk-17.0.1+12-jre jre
+  # mv jre java/
+  ```
+
+<div style="page-break-after: always;"></div>
+
+# Crear usuario **gbrestcomp**
+
+Crear un usuario de sistema llamado **gbrestcomp** que será el encargado de correr los procesos de Java.
+
+- Primero crear un grupo llamado **gbrestcomp**
+
+    ```console
+    # groupadd gbrestcomp
+    ```
+
+- Crear el usuario
+
+    ```console
+    # useradd -r -g gbrestcomp -d /opt/GBREST -s /bin/nologin gbrestcomp
+    ```
+
+- Crear directorio GBREST y asignarle permisos:
+
+    ```console
+    # mkdir /opt/GBREST
+    # chown -R gbrestcomp:gbrestcomp /opt/GBREST/
+    ```
+
+# Crear Llave de Encriptación o Semilla
+
+  - Crear un arhivo en */etc/systemd* llamado *gbrest.conf*
+
+    ```console
+    # touch /etc/systemd/gbrest.conf
+    ```
+
+  - Editar el mismo con su editor favorito y agregar el siguiente contenido:
+
+    ```ini
+    [Service]
+    SECRETKEY=millave
+    ```
+
+    donde *millave* es un string o semilla unica por ambiente para la encriptación.
+
+<div style="page-break-after: always;"></div>
+
+# Deshabilitar protocolos inseguros SSH (Seguridad de la Información)
+
+Crear el archivo */etc/crypto-policies/policies/modules/DISABLE-CBC.pmod*
+
+```console
+  # touch /etc/crypto-policies/policies/modules/DISABLE-CBC.pmod
+  ```
+
+con el siguiente contenido:
+
+```ini
+tls_cipher = -AES-256-CBC -AES-128-CBC
+cipher = -AES-128-CBC -AES-256-CBC -CAMELLIA-256-CBC -CAMELLIA-128-CBC
+ssh_cipher = -AES-128-CBC -AES-256-CBC
+```
+
+Ejecutar los siguientes comando:
+
+```console
+# update-crypto-policies --set DEFAULT:DISABLE-CBC
+# update-crypto-policies --show
+```
+
+# Deshabilitar protocolo para SSH
+
+Editar el archivo */etc/ssh/sshd_config*
+
+Comentar la linea que comienza con **Ciphers **, por lo general es la linea número 27.
+
+Luegi al final del mismo agregue la siguientes lineas:
+
+```config
+KexAlgorithms diffie-hellman-group-exchange-sha256
+MACs hmac-sha2-512,hmac-sha2-256
+Ciphers aes256-ctr,aes192-ctr,aes128-ctr
+```
+
+Verifique los protocolos habilitados y reinicie el servidor
+
+```console
+# sshd -T | grep kex
+# reboot
+```
+
+<div style="page-break-after: always;"></div>
+
+# Instalación de Nginx
+
+> **Nota:** Tener certificados digitales firmados por el área de Infraestructura TI.
+
+<!-- - Verificar los módulos de nginx disponibles:
+
+    ```console
+    # yum install nginx
+    # yum module list nginx
+    ```
+
+    La respuesta puede ser algo como:
+
+    ```console
+    Name      Stream          Profiles          Summary
+    nginx     1.14 [d][e]     common [d]        nginx webserver
+    nginx     1.16            common [d]        nginx webserver
+    nginx     1.18            common [d]        nginx webserver
+
+    Hint: [d]efault, [e]nabled, [x]disabled, [i]nstalled
+    ```
+    <br> -->
+- Subir al servidor el archivo rpm de instalación del nginx: **nginx-1.20.2-1.el8.ngx.x86_64.rpm**
+  > El mismo se encuentra en el servidor de desarrollo SLVD-0046 en /home/leonardochen
+
+- Instalar nginx:
+
+  ```console
+  # yum localinstall nginx-1.20.1-1.el8.ngx.x86_64.rpm
+  ```
+
+- Verificar la instalación:
+
+  ```console
+  # rpm -qa |grep nginx
+  #
+  ```
+
+- Crear directorio /etc/nginx/**tls** y colocar los certificados digitales en el mismo.
+- Ejecutar los siguientes comandos:
+  ```console
+  # restorecon -v -R /etc/nginx/tls/
+  ```
+
+- Permitir comunicación de nginx con proceso de Java:
+
+  ```console
+  # setsebool httpd_can_network_connect on -P
+
+  ```
+- Cambiar la página por defecto de nginx para que redireccione al Administrador:
+
+  > Reemplaze servidor por el nombre del servidor de balanceo.
+
+  ```console
+  # cd /usr/share/nginx/html
+  # mv index.html index.html.old
+  # echo "<html><head><meta http-equiv='refresh' content='0; url=https://servidor/administrator/'/></head><body></body></html>" > index.html
+  ```
+
+<div style="page-break-after: always;"></div>
+
+- Editar el archivo **/etc/nginx/nginx.conf**
+  - Agregar al bloque *http*, despues del parametro *keepalive_timeout* lo siguiente:
+
+    ```nginx
+    server_tokens   off;
+    ```
+
+    Con esto no se mostrara la versión de nginx en los headers de respuestas.
+
+<div style="page-break-after: always;"></div>
+
+- Editar el archivo **/etc/nginx/conf.d/default.conf**
+
+    - Reemplazar el contenido del archivo por el siguiente (reemplazar el nombre del certificado por el correspondiente del servidor):
+
+      ```nginx
+      server {
+          listen                          443 ssl;
+          server_name                     _;
+          root                            /usr/share/nginx/html;
+          ssl_certificate                 /etc/nginx/tls/slvd-0046_globalbank_local.cer;
+          ssl_certificate_key             /etc/nginx/tls/slvd-0046_globalbank_local.key;
+
+          ssl                             on;
+          ssl_protocols                   TLSv1.2;
+          ssl_ciphers                     PROFILE=SYSTEM;
+          ssl_prefer_server_ciphers       on;
+
+          add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+          add_header X-Frame-Options "SAMEORIGIN" always;
+          add_header X-Content-Type-Options "nosniff" always;
+          add_header Cache-Control "no-cache" always;
+
+          location / {
+          }
+
+          error_page 404 /404.html;
+          location = /40x.html {
+          }
+
+          error_page 500 502 503 504 /50x.html;
+          location = /50x.html {
+          }
+      }
+
+      ```
+
+- Habilitar el inicio automático del servicio nginx:
+
+    ```
+    # systemctl enable nginx
+    # systemctl start nginx
+    ```
+
+    > Si el segundo comando da error, reinicie el servidor y el mismo deberia levantar automaticamente.
+
+<div style="page-break-after: always;"></div>
+
+# Abrir puerto 443 https
+
+```console
+# firewall-cmd --zone=public --permanent --add-port=443/tcp
+# firewall-cmd --reload
+```
+
+# Crear configuración de los Componentes API REST
+
+  - Crear el archivo /opt/GBREST/*config.conf* y editelo:
+
+    ```console
+    # touch /opt/GBREST/config.conf
+    # vim /opt/GBREST/config.conf
+    ```
+
+  - Agregue el siguiente contenido y completelo junto con el equipo de Base de Datos:
+
+    Donde:
+
+      - DBSERVER: Servidor de Base de Datos.
+      - Instancia: Instancia de Base de Datos. Si no se require dejarlo en blanco y quitar los *\\\\*
+      - Puerto: Número de Puerto de Base de Datos. Si no se requiere dejarlo en blanco y quitar el *:*
+      - DBUSUARIO: Usuario de Base de Datos.
+      - DBPASSWORDENCRIPTADO: Password encriptado de Base de Datos. Utilice la herramienta **GBEncriptadorGUI**.
+      - SERVIDORCTS: Nombre o IP del Servidor de CTS correspondiente del ambiente que se esta instalando.
+      - IPDMZNET: IP del servidor .NET en la DMZ correspondiente del ambiente que se esta instalando.
+
+    <br>
+
+    ```ini
+    [Service]
+    APP_LOG_LEVEL=INFO
+    APP_LOG_TO_CONSOLE=false
+    APP_LOG_TO_FILE=true
+    APP_LOG_TO_FILE_PATH=logs/logs.log
+    # Descomentar la siguiente linea para ambientes de pruebas
+    # APP_SWAGGER_SUBMIT_METHODS=GET,PUT,DELETE,POST
+    # Descomentar la siguiente linea para ambientes de alta disponibilidad en los servidores workers, reemplaze servidor por el nombre del servidor con rol de balanceador nginx
+    # GBAPIADMINISTRATOR_WS_URI=//servidor:443/administrator/ws/commands/
+
+    # conexion a base de datos GBRESTDATA
+    GBREST_DB_DATA_SERVER=DBSERVER\\Instancia:Puerto
+    GBREST_DB_DATA_NAME=NOMBREBD
+    GBREST_DB_DATA_USERNAME=DBUSUARIO
+    GBREST_DB_DATA_PASSWORD=DBPASSWORDENCRIPTADO
+
+    # conexion a base de datos GBLOGSREST
+    GBREST_DB_LOGS_SERVER=DBSERVER\\Instancia:Puerto
+    GBREST_DB_LOGS_NAME=NOMBREBD
+    GBREST_DB_LOGS_USERNAME=DBUSUARIO
+    GBREST_DB_LOGS_PASSWORD=DBPASSWORDENCRIPTADO
+
+    # conexion a base de datos GLOBALDATA
+    GBREST_DB_GLOBALDATA_SERVER=DBSERVER\\Instancia:Puerto
+    GBREST_DB_GLOBALDATA_NAME=NOMBREBD
+    GBREST_DB_GLOBALDATA_USERNAME=DBUSUARIO
+    GBREST_DB_GLOBALDATA_PASSWORD=DBPASSWORDENCRIPTADO
+
+    # conexion a base de datos CATALOGOS
+    GBREST_DB_CATALOGOS_SERVER=DBSERVER\\Instancia:Puerto
+    GBREST_DB_CATALOGOS_NAME=NOMBREBD
+    GBREST_DB_CATALOGOS_USERNAME=DBUSUARIO
+    GBREST_DB_CATALOGOS_PASSWORD=DBPASSWORDENCRIPTADO
+
+    # conexion a base de datos NTCANAL
+    GBREST_DB_NTCANAL_SERVER=DBSERVER\\Instancia:Puerto
+    GBREST_DB_NTCANAL_NAME=NOMBREBD
+    GBREST_DB_NTCANAL_USERNAME=DBUSUARIO
+    GBREST_DB_NTCANAL_PASSWORD=DBPASSWORDENCRIPTADO
+
+    # conexion a base de datos APC
+    GBREST_DB_APC_SERVER=DBSERVER\\Instancia:Puerto
+    GBREST_DB_APC_NAME=NOMBREBD
+    GBREST_DB_APC_USERNAME=DBUSUARIO
+    GBREST_DB_APC_PASSWORD=DBPASSWORDENCRIPTADO
+
+    # SOAP
+    CTS_ENDPOINT=https://SERVIDORCTS:9443/genericspexec/GenericSPExecutorWSService
+    DMZ_EMAILS_ENDPOINT=https://IPDMZNET/globalbank/interface/generales/VerificarCorreoService.svc
+    DMZ_APC_ENDPONIT=https://IPDMZNET/globalbank/interface/apc/ConsultarScoreService.svc
+    ```
+
+  - Ejecutar el comando:
+
+    ```console
+    # restorecon -v -R /opt/GBREST/config.conf
+    ```
+
+
+<div style="page-break-after: always;"></div>
+
+# Importar certificado digital al KeyStore de Java para nodos worker
+
+  Si se trabaja en una configuración de alta disponibilidad, se debe agregar el certificado digital del servidor balanceador (nginx) al keystore de los servidores workers.
+
+  - Subir los certificados del servidor balanceador en un nuevo directorio en /opt/GBREST/**tls**
+
+  > La contraseña por defecto del keystore de java es: changeit
+
+  ```console
+  # mkdir /opt/GBREST/tls
+  # cd /opt/java/jre/lib/security
+  # /opt/java/jre/bin/keytool -import -alias servername -keystore cacerts -file /opt/GBREST/tls/servername_globalbank_local.cer
+  ```
+
+  reemplaze servername por el nombre del servidor, ejemplo: slvq-0033
+
+# Instalar componente Administrador
+
+> Si es un ambiente de alta disponibilidad, este solo se instala en el servidor con rol de balanceador.
+
+Si el componente Administrador no esta instalado, proceda a instalarlo:
+
+- Subir los archivos correspondiente de la instalación al servidor:
+  - install-administrator.sh
+  - update.sh
+  - rollback.sh
+  - IRESTAdministrator<version>.zip
+  - gbadministrator.service
+- Darle permisos de ejecución a los scripts:
+  ```console
+  # chmod +x update.sh rollback.sh install-administrator.sh
+  ```
+- Iniciar el instalador y siga los pasos indicados por el mismo:
+  ```console
+  # ./install-administrator.sh IRESTAdministrator<version>.zip
+  ```
+
+<div style="page-break-after: always;"></div>
+
+# Probar Aplicación desde navegador Web
+
+Abrir en enlace https://@server/administrator/
+
+Se debe mostrar la página para iniciar sesión:
+
+![directorio](restinstall/2.jpg)
+
+# Inicializar Componentes REST API
+
+> **Nota**: Este paso asume que las bases de datos *GBRESTDATA* y *GBLOGSREST* son nuevas y no tienen ninguna estructuras (Tablas, Procedimientos Almacenados, etc). Si ya tienen estructuras, el proceso fallara con un error 404 y no realizara ninguna acción.
+
+En un navegador abrir en enlace hacia el aplicativo: https://*(SERVER)*/administrator/setup/install/*(USUARIO ADMINISTRADOR)*
+
+- Donde:
+  - *(SERVER)*: Es el nombre o IP del servidor.
+  - *(USUARIO ADMINISTRADOR)*: Es el usuario inicial administrador de los componentes.
+
+Ejemplo: https://slvd-0046/administrator/setup/install/Leonardo%20Chen
+
+Si el proceso se ejecuta correctamente, se regresará automáticamente a la página de iniciar sesión donde ya se podrá ingresar con el usuaroi configurado anteriormente y su contraseña de dominio.
+
+<div style="page-break-after: always;"></div>
+
+# Crear Parámetros Iniciales y modulos
+
+- Ingresar y luego en el menú Configuraciones / Parámetros, crear los siguientes parámetros:
+
+  | Nombre | Tipo | Valor | Descripción |
+  | ------ | ---- | ----- | ----------- |
+  | ACTIVE_DIRECTORY_USERNAME | Plain | *Usuario para AD* | Usuario para conectarse al Active Directory para las consultas a usuario. |
+  | ACTIVE_DIRECTORY_PASSWORD | Secret | *Contraseña* | Contraseña para conectarse al Active Directory. |
+  | LOG_CATALOGOS | Plain | 0 | Guardar logs de Catálogos. |
+  | VERIFICAR_CORREO_CHECK_DMZ | Plain | 1 | Indica si se verifica el correo en la nube usando la DMZ. |
+  | APC_PASSWORD | Secret | *valor* | Contraseña para autenticar contra la APC. |
+  | APC_USER | Plain | *valor* | Usuario para autenticar contra la APC. |
+  | APC_VIGENCIA_DIAS | Plain | *valor* | Vigencia en días valida de los referencias guardadas localmente. |
+  | VERIFICAR_CORREO_VIGENCIA_DIAS | Plain | 365 | Vigencia en días para considerar como valido el resultado local de la verificación de correo. |
+  | ZEROBOUNCE_API_KEY | Secret | *API KEY* | API Key de ZeroBounce para validación de correos. |
+  | CMIS_USER | Plain | *usuario cmis* | Usuario para conectarse al servidor de CMIS. |
+  | CMIS_PASSWORD | Secret | *contraseña* | Contraseña para conectarse al CMIS. |
+  | CMIS_ATOMPUB_URL | Plain | *valor* | 	URL del servidor CMIS. |
+  | CMIS_BINDING_TYPE | Plain | *valor* | CMIS Binding Type. |
+  | CMIS_REPOSITORY_ID | Plain | *valor* | CMIS Repository ID. |
+  | CMIS_REPOSITORY_PATH | Plain | *valor* | Path para obtener documentos del Repositorio en CMIS. |
+
+  > Verifique que no tenga espacios al final al registrarlo.
+
+<div style="page-break-after: always;"></div>
+
+- En la menú Configuraciones / Usuarios REST, crear los siguientes usuarios y enviar por correo el token:
+
+  | Usuario | Habilitado | Utiliza Permisos | Fecha de Vencimiento | Rango de IPs | Descripción |
+  | ------- | ---------- | ---------------- | -------------------- | ------------ | ----------- |
+  | lchen | Sí | No | vacío | vacío | Usuario para Leonardo Chen. |
+  | aaizprua | Sí | No | vacío | vacío | Usuario para Abraham Aizprua. |
+
+- Verificar que los Modulos ya disponibles/instalados esten registrados en el menú Configuraciones / Modulos.
+
+<div style="page-break-after: always;"></div>
+
+# Configuración Balanceador - Alta disponibilidad
+
+Si se esta configurando un ambiente con multiples servidores, en modo de alta disponibilidad continuar con los siguientes pasos.
+
+- Ingresar al servidor con rol de balanceador.
+- Edite el archivo /etc/nginx/conf.d/default.conf
+- Agregue al inicio del archivo si no existe y arriba de la sección server lo siguiente:
+
+  > Reemplaze @server# por cada servidor con rol worker
+
+  ```nginx
+  upstream gbclustersrv {
+      least_conn;
+      server @server:443;
+      server @server:443;
+  }
+  ```
+
+- Luego dentro de server y debajo del administrator, agregue el location para modulo:
+
+  > Reemplaze @modulo por el nombre del modulo
+
+  ```nginx
+  location /@modulo {
+      proxy_set_header Host $host;
+      proxy_set_header Hostname $hostname;
+      proxy_set_header X-Real-IP $remote_addr;
+      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+      proxy_set_header X-Forwarded-Proto $scheme;
+      proxy_pass_request_headers on;
+      proxy_pass https://gbclustersrv;
+
+      proxy_http_version 1.1;
+      proxy_set_header Upgrade $http_upgrade;
+      proxy_set_header Connection "Upgrade";
+
+      proxy_hide_header Strict-Transport-Security;
+      proxy_hide_header X-Frame-Options;
+      proxy_hide_header X-Content-Type-Options;
+      proxy_hide_header Cache-Control;
+  }
+  ```
+
+  Por ejemplo para el ambiente de QA esta configurado como:
+
+  <div style="page-break-after: always;"></div>
+
+  ```nginx
+  upstream gbclustersrv {
+      least_conn;
+      server slvq-0034:443;
+      server slvq-0035:443;
+  }
+
+  server {
+    ...
+    location /gbbeca {
+        proxy_set_header Host $host;
+        proxy_set_header Hostname $hostname;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_pass_request_headers on;
+        proxy_pass https://gbclustersrv;
+
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "Upgrade";
+
+        proxy_hide_header Strict-Transport-Security;
+        proxy_hide_header X-Frame-Options;
+        proxy_hide_header X-Content-Type-Options;
+        proxy_hide_header Cache-Control;
+    }
+
+    location /gbcommons {
+        proxy_set_header Host $host;
+        proxy_set_header Hostname $hostname;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_pass_request_headers on;
+        proxy_pass https://gbclustersrv;
+
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "Upgrade";
+
+        proxy_hide_header Strict-Transport-Security;
+        proxy_hide_header X-Frame-Options;
+        proxy_hide_header X-Content-Type-Options;
+        proxy_hide_header Cache-Control;
+    }
+
+    location /gbbpm {
+        proxy_set_header Host $host;
+        proxy_set_header Hostname $hostname;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_pass_request_headers on;
+        proxy_pass https://gbclustersrv;
+
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "Upgrade";
+
+        proxy_hide_header Strict-Transport-Security;
+        proxy_hide_header X-Frame-Options;
+        proxy_hide_header X-Content-Type-Options;
+        proxy_hide_header Cache-Control;
+    }
+    ...
+  }
+
+  ```
+
+  Reiniciar servicio de nginx:
+
+  ```console
+  # systemctl stop nginx
+  # systemctl start nginx
+  ```
+
+# Conclusión
+
+Se ha configurado e instalado satisfactoriamente los Componentes API REST.
