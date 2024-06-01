@@ -1,0 +1,1501 @@
+import { logger } from "@/logger";
+import { BusinessException, MAINTENANCE_ERROR, MaintenanceModeException, NotFoundException, UnauthorizedException } from "./Exceptions";
+import { ZodError } from "zod";
+import { NextResponse } from "next/server";
+
+const ObjectId = require('mongoose').Types.ObjectId;
+
+const isValidObjectId = (id: string) => {
+  if (ObjectId.isValid(id)) {
+    if ((String)(new ObjectId(id)) === id) {
+      return true;
+    } else {
+      return false;
+    }
+  }
+
+  return false;
+}
+
+const parseException = (error: any) => {
+  logger.error(String(error));
+
+  if (error instanceof MaintenanceModeException) {
+    return NextResponse.json({
+      code: MAINTENANCE_ERROR,
+      message: "MaintenanceModeException"
+    }, { status: 503 });
+  } else if (error instanceof BusinessException) {
+    return NextResponse.json({
+      code: (error as BusinessException).code,
+      message: "BusinessException"
+    }, { status: 409 });
+  } else if (error instanceof UnauthorizedException) {
+    return new NextResponse("Unauthorized", {
+      status: 401
+    });
+  } else if (error instanceof NotFoundException) {
+    return new NextResponse("Not Found", {
+      status: 404
+    });
+  } else if (error instanceof ZodError) {
+    const errors: string[] = [];
+
+    for (const issue of error.issues) {
+      errors.push(`Invalid value in property ${issue.path[0]}`);
+    }
+
+    return NextResponse.json(errors, { status: 400 });
+  } else {
+    return new NextResponse("Internal Server Error", { status: 500 });
+  }
+}
+
+export  {isValidObjectId, parseException};
+
+-------------
+
+
+import { AuthOptions, getServerSession } from "next-auth";
+import AzureADProvider from "next-auth/providers/azure-ad";
+import type { GetServerSidePropsContext, NextApiRequest, NextApiResponse } from "next";
+import dbConnect from "./DB";
+import Users from "@/models/User";
+
+export const authOptions: AuthOptions = {
+    providers: [
+      AzureADProvider({
+        clientId: process.env.AZURE_AD_CLIENT_ID!,
+        clientSecret: process.env.AZURE_AD_CLIENT_SECRET!,
+        tenantId: process.env.AZURE_AD_TENANT_ID!,
+        authorization: {
+          params: {
+            scope: "openid profile user.Read email"
+          }
+        },
+        httpOptions: { timeout: 10000 }
+      }),
+    ],
+    callbacks: {
+      async jwt({ token, account }) {
+        if (account) {
+          token.idToken = account.id_token;
+          token.role = "X";
+
+          try {
+            await dbConnect();
+
+            const user = await Users.findOne({ username: token.name });
+
+            if (user) {
+              token.role = user.role;
+            }
+          } catch (_) {}
+        }
+
+        return token;
+      },
+      async session({ session, token }) {
+        if (session && session.user) {
+          session.user.role = token.role as string;
+        }
+
+        return session;
+      }
+    },
+}
+
+export function auth(...args: [GetServerSidePropsContext["req"], GetServerSidePropsContext["res"]] | [NextApiRequest, NextApiResponse] | []) {
+  return getServerSession(...args, authOptions)
+}
+
+
+---------------
+
+export const MAINTENANCE_ERROR = "300";
+export const QUOTA_EXCEEDED_ERROR = "100";
+export const SEND_OTP_ERROR = "101";
+export const NO_OTP_FOUND_ERROR = "102";
+export const OTP_NOT_MATCH = "103";
+export const OTP_EXPIRED = "104";
+export const OTP_VALIDATION_EXHAUSTED = "105";
+export const RATE_LIMIT_EXCEEDED = "110";
+
+export class BusinessException extends Error {
+  constructor(public code: string, public msg: string) {
+    super(msg);
+  }
+}
+
+export class UnauthorizedException extends Error {
+  constructor() {
+    super("Unauthorized");
+  }
+}
+
+export class NotFoundException extends Error {
+  constructor() {
+    super("Not Found");
+  }
+}
+
+export class MaintenanceModeException extends Error {
+  constructor() {
+    super("Under Maintenance");
+  }
+}
+
+
+---------
+
+import NextAuth from "next-auth"
+
+declare module "next-auth" {
+  /**
+   * Returned by `useSession`, `getSession` and received as a prop on the `SessionProvider` React Context
+   */
+  interface Session {
+    user:{
+      access_token: any & DefaultSession["user"];
+      accessTokenExpires: number;
+      role: string;
+      name: string;
+    }
+  }
+
+  interface User {
+    access_token: any & DefaultSession["user"];
+    accessTokenExpires: number;
+  }
+}
+
+declare module "next-auth/jwt" {
+  /** Returned by the `jwt` callback and `getToken`, when using JWT sessions */
+  interface JWT {
+    /** OpenID ID Token */
+    access_token?: string;
+  }
+}
+
+
+-------------
+
+import User from "@/models/User"
+import { authOptions } from "./authOptions";
+import { getServerSession } from "next-auth";
+import { MaintenanceModeException, UnauthorizedException } from "./Exceptions";
+import dbConnect from "./DB";
+
+const isInMaintenanceMode = (process.env.MAINTENANCE_MODE || "0") === "1";
+
+const checkAuth = async (requiredRole: string = "*") => {
+  if (isInMaintenanceMode) {
+    throw new MaintenanceModeException();
+  }
+
+  const session = await getServerSession(authOptions);
+
+  if (!session) {
+    throw new UnauthorizedException();
+  }
+
+  await dbConnect();
+
+  const user = await User.findOne({username: session.user.name});
+
+  if (!user) {
+    throw new UnauthorizedException();
+  }
+
+  if (requiredRole !== "*" && user.role !== requiredRole) {
+    throw new UnauthorizedException();
+  }
+
+  return user;
+}
+
+export {checkAuth};
+
+
+---------
+
+
+import { LRUCache } from "lru-cache";
+
+type Options = {
+  uniqueClientPerInterval?: number;
+  interval?: number;
+};
+
+export default function rateLimit(options?: Options) {
+  const clientCache = new LRUCache({
+    max: options?.uniqueClientPerInterval || 20,
+    ttl: options?.interval || 60000, // 1 minuto
+  });
+
+  return {
+    check: (limit: number, client: string) =>
+      new Promise<void>((resolve, reject) => {
+        console.log(client);
+        const clientCount = (clientCache.get(client) as number[]) || [0];
+        console.log(clientCount);
+
+        if (clientCount[0] === 0) {
+          clientCache.set(client, clientCount);
+        }
+
+        clientCount[0] += 1;
+
+        console.log(clientCount);
+
+        const currentUsage = clientCount[0];
+        const isRateLimited = currentUsage >= limit;
+
+        return isRateLimited ? reject() : resolve();
+      }),
+  };
+}
+
+
+-------
+
+import { NextResponse } from "next/server";
+import { RATE_LIMIT_EXCEEDED } from "./Exceptions";
+
+const okResponse = (data: any = null) => {
+  if (data) {
+    return NextResponse.json(data, {status: 200});
+  } else {
+    return new NextResponse("", {status: 200})
+  }
+}
+
+const unauthorized = () => {
+  return new Response('401 Unauthorized', {
+    status: 401
+  });
+}
+
+const rateLimitExceeded = () => {
+  return NextResponse.json({
+    code: RATE_LIMIT_EXCEEDED,
+    message: "rate limit exceeded"
+  }, {status: 429});
+}
+
+export {okResponse, unauthorized, rateLimitExceeded};
+
+
+-------------
+
+import {useEffect, useRef} from "react";
+
+const UseEffectOnce = (fn: () => void) => {
+  const effectRan = useRef(false);
+
+  useEffect(() => {
+    if (!effectRan.current) {
+      fn();
+
+      effectRan.current = true
+    }
+  }, []);
+};
+
+export default UseEffectOnce;
+
+
+--------------
+
+import { useRouter } from "next/navigation";
+
+const useFetch = () => {
+  const router = useRouter();
+
+  const buildRequest = (request: any) => {
+    let url = request?.url || request;
+
+    if (request.params) {
+      if (!url.endsWith('?')) url += '?';
+
+      url += new URLSearchParams(request.params);
+    }
+
+    return fetch(url, {
+      method: request?.method || "GET",
+      headers: request?.headers || {
+        'Accept': 'application/json',
+        'device': window?.navigator?.userAgent
+      },
+      cache: 'no-store',
+      body: request.data ? JSON.stringify(request.data) : null
+    });
+  }
+
+  const parseResponseBody = (responseBody: any) => {
+    try {
+      return JSON.parse(responseBody);
+    } catch (e) {
+      return responseBody;
+    }
+  }
+
+  const doGet = async (url: string, params: any = null, options: any = {}) => {
+    return await doRequest(buildRequest({url, params, method: "GET", ...options}));
+  }
+
+  const doPost = async (url: string, data: any, options: any = {}) => {
+    return await doRequest(buildRequest({url, data, method: "POST", ...options}));
+  }
+
+  const doPut = async (url: string, data: any, options: any = {}) => {
+    return await doRequest(buildRequest({url, data, method: "PUT", ...options}));
+  }
+
+  const doDelete = async (url: string, params: any = null, options: any = {}) => {
+    return await doRequest(buildRequest({url, params, method: "DELETE", ...options}));
+  }
+
+  const doRequest = async (callPromise: any) => {
+    try {
+      const response = await callPromise;
+      const responseBody = parseResponseBody(await response.text());
+
+      if (response.status >= 200 && response.status <= 299) {
+        return responseBody;
+      } else if (response.status === 401) {
+        return handleNoAuth();
+      } else if (response.status >= 500) {
+        return handleInternalError(responseBody);
+      } else {
+        throw new Error(response.status + ": " + responseBody);
+      }
+    } catch (error: any) {
+      if (error?.response?.status === 401) {
+        return handleNoAuth();
+      } else if (error?.response?.status >= 500) {
+        return handleInternalError(await error.response.text());
+      } else {
+        if (error?.response?.status) {
+          throw new Error(error.response.status + ": " + parseResponseBody(await error.response.text()));
+        } else {
+          throw new Error(error.message);
+        }
+      }
+    }
+  }
+
+  const handleNoAuth = () => {
+    // este path no, ya que esta iniciando el flujo y puede q no tenga token aun.
+    router.push("/session-expired");
+
+    return null;
+  }
+
+  const handleInternalError = (responseBody: any) => {
+    throw new Error(responseBody);
+  }
+
+  return {doGet, doPost, doPut, doDelete};
+}
+
+export default useFetch;
+
+--------------------
+
+import dayjs from "dayjs";
+import {notifications} from "@mantine/notifications";
+
+const formatDate = (date: string | number | Date | dayjs.Dayjs | undefined) => {
+  return date ? dayjs(date).format('DD/MM/YYYY hh:mm:ss a') : "";
+}
+
+const showDefaultSuccessNotification = (message = "Se ha guardado satisfactoriamente! 😊", title = "Confirmación") => {
+  notifications.show({
+    title,
+    message,
+    color: "green"
+  });
+}
+
+const showDefaultErrorNotification = (message = "Ha ocurrido un error! 😟", title = "Error") => {
+  notifications.show({
+    title,
+    message,
+    color: "red"
+  });
+}
+
+const showDefaultDeleteNotification = (message = "Se ha eliminado satisfactoriamente! 😊", title = "Confirmación") => {
+  notifications.show({
+    title,
+    message,
+    color: "green"
+  });
+}
+
+const buildSelectDataSource = (data: any[], valueField = "_id", labelField = "name") => {
+  return data.map(d => {
+    return {value: String(d[valueField]), label: String(d[labelField])};
+  });
+}
+
+const formatValue = (value: number) => {
+  return new Intl.NumberFormat('en-US').format(value);
+}
+
+const validateField = ({value, allowEmptyOrNull = false, regex, errorMessage}: {
+  value: any,
+  allowEmptyOrNull: boolean,
+  regex: RegExp,
+  errorMessage?: string
+}) => {
+  const err = errorMessage ? errorMessage : "Este campo es requerido.";
+
+  if (!allowEmptyOrNull && (value === undefined || value === null || value === "")) {
+    return err;
+  }
+
+  if (allowEmptyOrNull && (value === undefined || value === null || value === "")) {
+    return null;
+  }
+
+  if (regex && !regex.test(value)) {
+    return "Valor con formato incorrecto";
+  }
+
+  return null;
+}
+
+export { formatDate, showDefaultSuccessNotification, showDefaultErrorNotification,
+  showDefaultDeleteNotification, buildSelectDataSource, formatValue, validateField };
+
+
+-------------
+
+const generateRandomNumber = (size: number) => {
+  const arr: string[] = [];
+
+  while (arr.length < size) {
+    const x = Math.floor( Math.random() * 9) + 0;
+
+    if (!arr.includes(String(x))) {
+      arr.push(String(x));
+    }
+  }
+
+  return arr.join("");
+}
+
+------------------
+
+"use client";
+
+import { MantineProvider } from '@mantine/core';
+import { ModalsProvider } from "@mantine/modals";
+import { Notifications } from '@mantine/notifications';
+import { SessionProvider } from "next-auth/react";
+import 'dayjs/locale/es-us';
+import { DatesProvider } from '@mantine/dates';
+
+export default function Providers({
+  children,
+}: Readonly<{
+  children: React.ReactNode;
+}>) {
+  return (
+    <SessionProvider>
+      <MantineProvider>
+        <ModalsProvider>
+          <Notifications />
+          <DatesProvider settings={{ locale: 'es-us' }}>
+            {children}
+          </DatesProvider>
+        </ModalsProvider>
+      </MantineProvider>
+    </SessionProvider>
+  )
+}
+
+
+--------------
+
+import {DataTable, DataTableSortStatus} from 'mantine-datatable';
+import {useEffect, useMemo, useState} from "react";
+import {ActionIcon, Menu, Text, Tooltip} from "@mantine/core";
+import Icon from "@mdi/react";
+import {
+  mdiCogOutline,
+  mdiEye,
+  mdiRefresh,
+  mdiSquareEditOutline,
+  mdiTrashCan
+} from "@mdi/js";
+import {modals} from "@mantine/modals";
+import UseEffectOnce from '@/lib/useEffectOnce';
+import useFetch from '@/lib/useFetch';
+import ErrorMessage from './ErrorMessage';
+import LoadingScreen from './LoadingScreen';
+
+const PAGE_SIZE: number = 10;
+
+interface MyProps {
+  baseUrl: string;
+  columns: any[];
+  filters: any;
+  defaultSortColumn?: string;
+  defaultSortDirection?: string;
+  onEditAction?: any;
+  onViewAction?: any;
+  onDeleteAction?: any;
+  deleteSpec?: any;
+  idAccessor?: string;
+}
+
+const CustomDataTableRemote = ({baseUrl, columns, idAccessor = "_id", defaultSortColumn  = "_id",
+    defaultSortDirection = "asc", filters,
+    onEditAction = null, onViewAction = null, onDeleteAction = null,
+    deleteSpec = {key: "_id", deleteMsgObject: "registro"}}: MyProps) => {
+
+  const { doPost } = useFetch();
+  const [data, setData] = useState<any[]>([]);
+  const [fetching, setFetching] = useState(false);
+  const [totalRecords, setTotalRecords] = useState(0);
+  const [errorMsg, setErrorMsg] = useState("");
+  const [loaded, setLoaded] = useState(false);
+
+  // sorting
+  const [sortStatus, setSortStatus] = useState<DataTableSortStatus<any>>({
+    columnAccessor: defaultSortColumn,
+    direction: defaultSortDirection.toLowerCase() === "asc" ? "asc" : "desc"
+  });
+
+  // pagination
+  const [page, setPage] = useState(1);
+
+  useEffect(() => {
+    if (loaded) onSortStatusChange();
+  }, [sortStatus]);
+
+  const onSortStatusChange = async () => {
+    if (loaded) {
+      setPage(1);
+      await loadData();
+    }
+  }
+
+  const onPageChange = async (page: number) => {
+    if (loaded) {
+      setPage(page);
+      await loadData(page);
+    }
+  }
+
+  const loadData = async (pageNumber = 1) => {
+    try {
+      setFetching(true);
+
+      const response = await doPost(baseUrl, {
+        page: pageNumber,
+        sortBy: sortStatus.columnAccessor,
+        sortDirection: sortStatus.direction,
+        ...filters
+      });
+
+      setData(response.data);
+      setTotalRecords(response.totalRecords);
+      setErrorMsg("");
+    } catch (error: any) {
+      setErrorMsg(error.message);
+    } finally {
+      setLoaded(true);
+      setFetching(false);
+    }
+  }
+
+  const onRefreshData = async () => {
+    loadData(page);
+  }
+
+  UseEffectOnce(async () => {
+    await loadData();
+  });
+
+  useEffect(() => {
+    const applyFilters = async () => {
+      if (loaded) {
+        await loadData();
+      }
+    }
+
+    applyFilters();
+  }, [filters])
+
+  // column definition
+  const tableColumns = useMemo(() => {
+    // @ts-ignore
+    let c = [];
+
+    // @ts-ignore
+    c = [...c, ...columns];
+
+    if (onViewAction || onEditAction || onDeleteAction) {
+      c.push({
+        accessor: 'actions',
+        title: '',
+        width: 50,
+        render: (row: any) => {
+          const count = [onViewAction, onEditAction, onDeleteAction]
+            .filter(fn => fn !== null).length;
+
+          if (count > 1) {
+            return (
+              <Menu shadow="md" width={200} position="bottom-end">
+                <Menu.Target>
+                  <ActionIcon variant='transparent'>
+                    <Icon path={mdiCogOutline} size="1.3rem" />
+                  </ActionIcon>
+                </Menu.Target>
+
+                <Menu.Dropdown>
+                  {onViewAction && <Menu.Item leftSection={<Icon path={mdiEye} size="1.2rem" color="#22c55e"/>}
+                                              onClick={() => onViewAction(row)}>Ver</Menu.Item>}
+
+                  {onEditAction && <Menu.Item leftSection={<Icon path={mdiSquareEditOutline} size="1.2rem" color="#3b82f6"/>}
+                                              onClick={() => onEditAction(row)}>Editar</Menu.Item>}
+
+                  {onDeleteAction && (
+                    <>
+                      <Menu.Divider/>
+
+                      <Menu.Item leftSection={<Icon path={mdiTrashCan} size="1.2rem" color="#ef4444"/>}
+                                 onClick={() => onDelete(row)}>Eliminar</Menu.Item>
+                    </>
+                  )}
+                </Menu.Dropdown>
+              </Menu>
+            );
+          } else {
+            if (onViewAction) {
+              return (
+                <Tooltip label="Ver" position="left" withArrow>
+                  <ActionIcon onClick={() => onViewAction(row)} variant='transparent'>
+                    <Icon color="#22c55e" path={mdiEye} size="1.3rem" />
+                  </ActionIcon>
+                </Tooltip>
+              );
+            } else if (onEditAction) {
+              return (
+                <Tooltip label="Editar" position="left" withArrow>
+                  <ActionIcon onClick={() => onEditAction(row)} variant='transparent'>
+                    <Icon color="#3b82f6" path={mdiSquareEditOutline} size="1.3rem" />
+                  </ActionIcon>
+                </Tooltip>
+              );
+            } else if (onDeleteAction) {
+              return (
+                <Tooltip label="Eliminar" position="left" withArrow>
+                  <ActionIcon onClick={() => onDeleteAction(row)} variant='transparent'>
+                    <Icon color="#ef4444" path={mdiTrashCan} size="1.3rem" />
+                  </ActionIcon>
+                </Tooltip>
+              );
+            }
+          }
+        }
+      });
+    }
+
+    return c;
+  }, [columns]);
+
+  const onDelete = (row: any) => {
+    modals.openConfirmModal({
+      title: 'Confirmación',
+      centered: true,
+      children: (
+        <Text size="sm">
+          ¿Estás seguro de eliminar al {deleteSpec.deleteMsgObject} {row[deleteSpec.key]}?
+        </Text>
+      ),
+      labels: {confirm: 'Eliminar', cancel: "Cancelar"},
+      confirmProps: {color: 'red'},
+      onConfirm: () => onDeleteAction(row)
+    });
+  }
+
+  return (
+    <>
+      <br/>
+      {errorMsg && <ErrorMessage errorMsg={errorMsg} />}
+
+      {!loaded && <LoadingScreen type="listLayoutWithAddButton" /> }
+
+      {loaded &&
+        <>
+          <div className="w-full text-right mb-5">
+            <Tooltip label="Refrescar Datos" position="left" withArrow>
+              <ActionIcon variant="transparent" size="2.1rem" onClick={onRefreshData}>
+                <Icon path={mdiRefresh} size="2rem" />
+              </ActionIcon>
+            </Tooltip>
+          </div>
+
+          {data.length > 0 &&
+            <div>
+              <DataTable
+                fetching={fetching}
+                idAccessor={idAccessor || "_id"}
+                withTableBorder
+                borderRadius="sm"
+                shadow="md"
+                withColumnBorders
+                verticalAlign="top"
+                striped
+                highlightOnHover
+                records={data}
+                columns={tableColumns}
+                sortStatus={sortStatus}
+                onSortStatusChange={setSortStatus}
+                totalRecords={totalRecords}
+                recordsPerPage={PAGE_SIZE}
+                page={page}
+                onPageChange={onPageChange}
+                paginationText={({ from, to, totalRecords }) => `Registros ${from} - ${to} de ${totalRecords}`}
+              />
+            </div>
+          }
+
+          {data && data.length === 0 && <p>No se encontraron registros</p>}
+        </>
+      }
+    </>
+  );
+};
+
+export default CustomDataTableRemote;
+
+
+---------------------
+
+import {DataTable, DataTableSortStatus} from 'mantine-datatable';
+import {useEffect, useMemo, useState} from "react";
+import {ActionIcon, Menu, Text, TextInput, Tooltip} from "@mantine/core";
+import Icon from "@mdi/react";
+import {
+  mdiCogOutline,
+  mdiEye,
+  mdiFilter,
+  mdiRefresh,
+  mdiSquareEditOutline,
+  mdiTrashCan
+} from "@mdi/js";
+import {modals} from "@mantine/modals";
+import {useDebouncedState} from "@mantine/hooks";
+
+import sortBy from 'lodash/sortBy';
+import get from 'lodash/get';
+import LoadingScreen from './LoadingScreen';
+
+const PAGE_SIZE: number = 10;
+
+interface MyProps {
+  data: any[] | null;
+  columns: any[];
+  simpleSearchColumns?: any;
+  onRefreshData?: any;
+  defaultSort?: any;
+  onEditAction?: any;
+  onViewAction?: any;
+  onDeleteAction?: any;
+  deleteSpec?: any;
+  fetching: boolean;
+  idAccessor?: string;
+}
+
+const CustomDataTable = ({data, columns, simpleSearchColumns = null, idAccessor,
+                           onRefreshData = null, defaultSort = 0, fetching,
+                           onEditAction = null, onViewAction = null, onDeleteAction = null,
+                           deleteSpec = {key: "_id", deleteMsgObject: "registro"}}: MyProps) => {
+  // sorting
+  const [sortStatus, setSortStatus] =
+    useState<DataTableSortStatus<any>>({ columnAccessor: defaultSort === 0
+      ? columns[0].accessor
+      : defaultSort, direction: 'asc' });
+
+  // pagination
+  const [page, setPage] = useState(1);
+
+  // data filtering
+  const [filterValue, setFilterValue] = useDebouncedState('', 300);
+
+  const filteredData = useMemo(() => {
+    if (simpleSearchColumns && data) {
+      let temp = [];
+
+      if (!filterValue) {
+        temp = sortBy(data, sortStatus.columnAccessor);
+      } else {
+        temp = sortBy(data.filter(d => {
+          for (let i=0;i < simpleSearchColumns.length; ++i) {
+            const field = simpleSearchColumns[i];
+
+            if (get(d, field) && get(d, field).toLowerCase().indexOf(filterValue.toLowerCase()) !== -1) {
+              return true;
+            }
+          }
+
+          return false;
+        }), sortStatus.columnAccessor);
+      }
+
+      return sortStatus.direction === 'asc' ? temp : temp.reverse();
+    } else {
+      return [];
+    }
+  }, [simpleSearchColumns, data, filterValue, sortStatus]);
+
+  const paginatedData = useMemo(() => {
+    const from = (page - 1) * PAGE_SIZE;
+    const to = from + PAGE_SIZE;
+
+    return filteredData.slice(from, to);
+  }, [filteredData, page]);
+
+  useEffect(() => {
+    setPage(1)
+  }, [sortStatus]);
+
+  // column definition
+  const tableColumns = useMemo(() => {
+    // @ts-ignore
+    let c = [];
+
+    // @ts-ignore
+    c = [...c, ...columns];
+
+    if (onViewAction || onEditAction || onDeleteAction) {
+      c.push({
+        accessor: 'actions',
+        title: '',
+        width: 50,
+        render: (row: any) => {
+          const count = [onViewAction, onEditAction, onDeleteAction]
+            .filter(fn => fn !== null).length;
+
+          if (count > 1) {
+            return (
+              <Menu shadow="md" width={200} position="bottom-end">
+                <Menu.Target>
+                  <ActionIcon variant='transparent'>
+                    <Icon path={mdiCogOutline} size="1.3rem" />
+                  </ActionIcon>
+                </Menu.Target>
+
+                <Menu.Dropdown>
+                  {onViewAction && <Menu.Item leftSection={<Icon path={mdiEye} size="1.2rem" color="#22c55e"/>}
+                                              onClick={() => onViewAction(row)}>Ver</Menu.Item>}
+
+                  {onEditAction && <Menu.Item leftSection={<Icon path={mdiSquareEditOutline} size="1.2rem" color="#3b82f6"/>}
+                                              onClick={() => onEditAction(row)}>Editar</Menu.Item>}
+
+                  {onDeleteAction && (
+                    <>
+                      <Menu.Divider/>
+
+                      <Menu.Item leftSection={<Icon path={mdiTrashCan} size="1.2rem" color="#ef4444"/>}
+                                 onClick={() => onDelete(row)}>Eliminar</Menu.Item>
+                    </>
+                  )}
+                </Menu.Dropdown>
+              </Menu>
+            );
+          } else {
+            if (onViewAction) {
+              return (
+                <Tooltip label="Ver" position="left" withArrow>
+                  <ActionIcon onClick={() => onViewAction(row)} variant='transparent'>
+                    <Icon color="#22c55e" path={mdiEye} size="1.3rem" />
+                  </ActionIcon>
+                </Tooltip>
+              );
+            } else if (onEditAction) {
+              return (
+                <Tooltip label="Editar" position="left" withArrow>
+                  <ActionIcon onClick={() => onEditAction(row)} variant='transparent'>
+                    <Icon color="#3b82f6" path={mdiSquareEditOutline} size="1.3rem" />
+                  </ActionIcon>
+                </Tooltip>
+              );
+            } else if (onDeleteAction) {
+              return (
+                <Tooltip label="Eliminar" position="left" withArrow>
+                  <ActionIcon onClick={() => onDeleteAction(row)} variant='transparent'>
+                    <Icon color="#ef4444" path={mdiTrashCan} size="1.3rem" />
+                  </ActionIcon>
+                </Tooltip>
+              );
+            }
+          }
+        }
+      });
+    }
+
+    return c;
+  }, [columns]);
+
+  const onDelete = (row: any) => {
+    modals.openConfirmModal({
+      title: 'Confirmación',
+      centered: true,
+      children: (
+        <Text size="sm">
+          ¿Estás seguro de eliminar al {deleteSpec.deleteMsgObject} {row[deleteSpec.key]}?
+        </Text>
+      ),
+      labels: {confirm: 'Eliminar', cancel: "Cancelar"},
+      confirmProps: {color: 'red'},
+      onConfirm: () => onDeleteAction(row)
+    });
+  }
+
+  return (
+    <>
+      {!data && <LoadingScreen type="listLayoutWithAddButton" /> }
+
+      {data &&
+        <>
+          <div className="w-full flex gap-2 mb-5">
+            <div className="flex-1">
+              {simpleSearchColumns &&
+                <TextInput rightSection={<Icon path={mdiFilter} size={1} />}
+                          type="search" placeholder="Filtrar..." className="w-full"
+                          onChange={(event) => setFilterValue(event.currentTarget.value)}
+                />}
+            </div>
+
+            {onRefreshData && <Tooltip label="Refrescar Datos" position="left" withArrow>
+              <ActionIcon variant="transparent" size="2.1rem" onClick={onRefreshData}>
+                <Icon path={mdiRefresh} size="2rem" />
+              </ActionIcon>
+            </Tooltip>}
+          </div>
+
+          {filteredData.length > 0 &&
+            <div>
+              <DataTable
+                fetching={fetching}
+                idAccessor={idAccessor || "_id"}
+                withTableBorder
+                borderRadius="sm"
+                shadow="md"
+                withColumnBorders
+                verticalAlign="top"
+                striped
+                highlightOnHover
+                records={paginatedData}
+                columns={tableColumns}
+                sortStatus={sortStatus}
+                onSortStatusChange={setSortStatus}
+                totalRecords={filteredData.length}
+                recordsPerPage={PAGE_SIZE}
+                page={page}
+                onPageChange={(p) => setPage(p)}
+                paginationText={({ from, to, totalRecords }) => `Registros ${from} - ${to} de ${totalRecords}`}
+              />
+            </div>
+          }
+
+          {data && filteredData.length === 0 && <p>No se encontraron registros</p>}
+        </>
+      }
+    </>
+  );
+};
+
+export default CustomDataTable;
+
+
+-------------
+
+
+import type { Metadata } from "next";
+
+import "./globals.css";
+
+import '@mantine/core/styles.css'
+import '@mantine/notifications/styles.css';
+import 'mantine-datatable/styles.css';
+import '@mantine/charts/styles.css';
+import '@mantine/dates/styles.css';
+import { ColorSchemeScript } from "@mantine/core";
+import Providers from "@/components/Providers";
+
+export const metadata: Metadata = {
+  title: "GlobalBank OTP Console",
+  description: "GlobalBank OTP WebConsole Administration",
+};
+
+export default function RootLayout({
+  children,
+}: Readonly<{
+  children: React.ReactNode;
+}>) {
+  return (
+    <html lang="es">
+      <head>
+        <meta name="viewport" content="initial-scale=1.0, width=device-width" />
+        <meta name="robots" content='noindex' />
+        <ColorSchemeScript />
+      </head>
+      <body>
+        <Providers>
+          {children}
+        </Providers>
+      </body>
+    </html>
+  );
+}
+
+
+-------------
+
+@layer tailwind {
+  @tailwind base;
+}
+@tailwind components;
+@tailwind utilities;
+
+@font-face {
+  font-family: 'Poppins';
+  src: url('/fonts/Poppins/Poppins-Regular.ttf');
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Poppins-Bold';
+  src: url('/fonts/Poppins/Poppins-Bold.ttf');
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Poppins-Light';
+  src: url('/fonts/Poppins/Poppins-Light.ttf');
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Poppins-Medium';
+  src: url('/fonts/Poppins/Poppins-Medium.ttf');
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Poppins-ExtraLight';
+  src: url('/fonts/Poppins/Poppins-ExtraLight.ttf');
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Roboto';
+  src: url('/fonts/Roboto/Roboto-Regular.ttf');
+}
+
+@font-face {
+  font-family: 'Heebo';
+  src: url('/fonts/Heebo/Heebo-Bold.ttf');
+}
+
+@font-face {
+  font-family: 'Red Hat Display';
+  src: url('/fonts/RedHatDisplay/RedHatDisplay-Regular.ttf');
+}
+
+@font-face {
+  font-family: 'Red Hat Display Medium';
+  src: url('/fonts/RedHatDisplay/RedHatDisplay-Medium.ttf');
+}
+
+@font-face {
+  font-family: 'Red Hat Display SemiBold';
+  src: url('/fonts/RedHatDisplay/RedHatDisplay-SemiBold.ttf');
+}
+
+@font-face {
+  font-family: 'Red Hat Display Bold';
+  src: url('/fonts/RedHatDisplay/RedHatDisplay-Bold.ttf');
+}
+
+html, body {
+  height: 100%;
+  width: 100%;
+  padding: 0;
+  margin: 0;
+  background-color: #ffffff;
+  font-family: 'Poppins';
+  font-style: normal;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+}
+
+------------
+
+import dbConnect from "@/lib/DB";
+import Otp from "@/models/Otp";
+import { parseException } from "@/lib/ApiUtils";
+import { checkAuth, projectHaveSentQuota } from "@/lib/PublicApiValidations";
+import { okResponse, rateLimitExceeded } from "@/lib/ResponseFactory";
+import { IRequestBody, requestFormSchema } from "./RequestValidation";
+import invalidateAllOtpUseCase from "@/usecases/otp/InvalidateAllOtpUseCase";
+import generateOtpUseCase from "@/usecases/otp/GenerateOtpUseCase";
+import sendOtpUseCase from "@/usecases/otp/SendOtpUseCase";
+import { OTP_LIFE_TIME_IN_MINUTES } from "@/lib/Constants";
+import rateLimit from "@/lib/RateLimit";
+
+// maximo 15 peticiones cada 30 segundos para ese usuario
+const SEND_OTP_RATE_LIMIT_INTERVAL = 30;
+const SEND_OTP_RATE_LIMIT_NUMBER = 15;
+
+const limiter = rateLimit({
+  interval: SEND_OTP_RATE_LIMIT_INTERVAL * 1000, // # seconds
+});
+
+export async function POST(request: Request) {
+  try {
+    await limiter.check(SEND_OTP_RATE_LIMIT_NUMBER, request.headers.get("username") || "unknow");
+  } catch(_error) {
+    return rateLimitExceeded();
+  }
+
+  try {
+    // validar request sea valido
+    var body = requestFormSchema.parse(await request.json()) as IRequestBody;
+
+    if (body.templateData === undefined || body.templateData === null) {
+      body.templateData = [];
+    }
+
+    await dbConnect();
+    const {project, user} = await checkAuth(request);
+
+    // valida si tiene capacidad para enviar otp
+    projectHaveSentQuota(project, body.channel);
+
+    // Invalidar otp activo si tiene
+    await invalidateAllOtpUseCase(project._id, user.username, body.recipient);
+
+    // 5. Generar y guardar Otp
+    const code = generateOtpUseCase(project.otpSize);
+
+    body.templateData.push({
+      name: "code",
+      value: code
+    });
+
+    const otp = await Otp.create({
+      code: code,
+      channel: body.channel,
+      projectId: project._id,
+      template: body.channel.toUpperCase() === "SMS" ? project.templateSms : project.templateEmail,
+      templateData: body.templateData,
+      expiryDate: addMinutes(new Date(), project.otpLifeInMinutes || OTP_LIFE_TIME_IN_MINUTES),
+      emailSubject: body.channel.toUpperCase() === "EMAIL" ? project.emailSubject : null,
+      recipient: body.recipient,
+      projectUser: user.username,
+      maxRetry: project.maxRetry
+    });
+
+    // 6. Enviar Otp
+    await sendOtpUseCase(project, user, otp);
+
+    return okResponse();
+  } catch (error) {
+    return parseException(error);
+  }
+}
+
+function addMinutes(date: Date, minutes: number) {
+  date.setMinutes(date.getMinutes() + minutes);
+  return date;
+}
+
+
+++++++++++++++++++++++++++++++++++
+
+install.sh
+
+#!/bin/bash
+# Script para instalar un componente REST
+
+PORT=9002
+SERVICE="gbcommons"
+COMPONENTDIR="GBCommons"
+
+if [ "$1" = "" ]
+then
+  echo "Usage: $0 <deployment.zip>"
+  echo "Error: You must specify deployment zip file to be installed."
+  exit 1
+fi
+
+if [ ! -f "$1" ]; then
+  echo "Deployment $1 does not exists"
+  exit 1
+fi
+
+echo "Paso 1: Creando directorio /opt/GBREST/$COMPONENTDIR"
+[ ! -d "/opt/GBREST/$COMPONENTDIR" ] && mkdir "/opt/GBREST/$COMPONENTDIR"
+
+echo "Paso 2: Creando directorio de logs /opt/GBREST/$COMPONENTDIR/logs"
+[ ! -d "/opt/GBREST/$COMPONENTDIR/logs" ] && mkdir "/opt/GBREST/$COMPONENTDIR/logs"
+
+echo "Paso 3: Instalando componente $SERVICE"
+
+unzip $1 -d "/opt/GBREST/$COMPONENTDIR"
+cp update.sh "/opt/GBREST/$COMPONENTDIR"
+cp rollback.sh "/opt/GBREST/$COMPONENTDIR"
+chmod +x "/opt/GBREST/$COMPONENTDIR/update.sh"
+chmod +x "/opt/GBREST/$COMPONENTDIR/rollback.sh"
+chown -R gbrestcomp:gbrestcomp "/opt/GBREST/$COMPONENTDIR"
+
+[ ! -d "/opt/GBREST/$COMPONENTDIR/deployments" ] && mkdir "/opt/GBREST/$COMPONENTDIR/deployments"
+
+cp $1 "/opt/GBREST/$COMPONENTDIR/deployments"
+
+echo "Paso 4: Instalando servicio Linux $SERVICE.service en /etc/systemd/system/"
+cp "$SERVICE.service" /etc/systemd/system/
+chown root:root "/etc/systemd/system/$SERVICE.service"
+chmod 755 "/etc/systemd/system/$SERVICE.service"
+restorecon "/etc/systemd/system/$SERVICE.service"
+
+echo "Paso 5: Arrancando servicio $SERVICE.service"
+
+systemctl daemon-reload
+sleep 5
+systemctl start "$SERVICE.service"
+sleep 5
+systemctl enable "$SERVICE.service"
+
+echo "Paso 6: Configuracion nginx"
+echo "Por favor pegue la siguiente configuración dentro del archivo /etc/nginx/conf.d/default.conf de la sección server:"
+echo ""
+echo ""
+
+cat << EOF
+location /$SERVICE {
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Cache-Control "no-cache" always;
+
+    proxy_set_header Host \$host;
+    proxy_set_header Hostname \$hostname;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+    proxy_pass_request_headers on;
+    proxy_pass http://127.0.0.1:$PORT/$SERVICE;
+
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade \$http_upgrade;
+    proxy_set_header Connection "Upgrade";
+
+    proxy_hide_header Cache-Control;
+}
+EOF
+
+echo ""
+echo ""
+read -p "Presione ENTER para abrir vim hacia el archivo /etc/nginx/conf.d/default.conf"
+
+vim "/etc/nginx/conf.d/default.conf"
+
+echo "Paso 7: Reiniciando servidor nginx"
+
+systemctl stop nginx
+sleep 5
+systemctl start nginx
+
+echo "Instalación finalizada correctamente!"
+echo "Recuerde registrar el modulo recien instalado en el Administrador de Componentes API REST"
+
+exit 0
+
+-----------------------------
+
+module.service
+
+[Unit]
+Description=GlobalBank REST API Components- Commons
+Wants=network.target
+After=syslog.target network.target
+
+[Service]
+EnvironmentFile=/etc/systemd/gbrest.conf
+EnvironmentFile=/opt/GBREST/config.conf
+User=gbrestcomp
+Group=gbrestcomp
+Type=simple
+KillMode=process
+WorkingDirectory=/opt/GBREST/GBCommons
+ExecStart=/opt/java/jre/bin/java -Xmx1024m -jar quarkus-run.jar
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+
+-------------
+
+rollback.sh
+
+#!/bin/bash
+# Script para hacer rollback al penultimo despliegue de  componentes
+
+SERVICE="gbcommons"
+
+service_exists() {
+  if [[ $(systemctl list-units --all -t service --full --no-legend "$SERVICE.service" | cut -f1 -d' ') == $SERVICE.service ]]; then
+    return 0
+  else
+    return 1
+  fi
+}
+
+if ! service_exists ; then
+  echo "Service $SERVICE does not exists"
+  exit 1
+fi
+
+# verificar si hay rollbacks
+
+if [ ! -d "backups" ]; then
+  echo "No backups avaliables"
+  exit 1
+fi
+
+bkpcount=(`ls -l backups/ | grep ^d | wc -l`)
+
+if [ $bkpcount -le 1 ]; then
+  echo "No backup avaliable to make rollback"
+  exit 1
+fi
+
+bkpdir=(`names=( backups/* ); echo ${names[-1]}`)
+
+echo "The backup $bkpdir has been selected to restore"
+
+[ ! -d "regressed" ] && mkdir "regressed"
+
+echo "Stopping service $SERVICE"
+
+systemctl stop $SERVICE
+sleep 5
+
+mv app/ lib/ quarkus/ quarkus-app-dependencies.txt quarkus-run.jar regressed/
+
+echo "Current deployment have been moved to regressed directory"
+
+echo "Rolling back"
+
+cp -r $bkpdir/* .
+
+echo "Starting Service $SERVICE"
+
+systemctl start $SERVICE
+
+echo "Rollback success"
+
+exit 0
+
+---------------
+
+update.sh
+
+#!/bin/bash
+# Script para actualizar componentes
+
+SERVICE="gbcommons"
+
+service_exists() {
+  if [[ $(systemctl list-units --all -t service --full --no-legend "$SERVICE.service" | cut -f1 -d' ') == $SERVICE.service ]]; then
+    return 0
+  else
+    return 1
+  fi
+}
+
+if ! service_exists ; then
+  echo "Service $SERVICE does not exists"
+  exit 1
+fi
+
+if [ "$1" = "" ]
+then
+  echo "Usage: $0 <deployment.zip>"
+  echo "Error: You must specify deployment zip file to be installed."
+  exit 1
+fi
+
+if [ ! -f $1 ]; then
+  echo "Deployment $1 does not exists"
+  exit 1
+fi
+
+echo "Appliying deployment $SERVICE-$1"
+
+echo "Stopping current component $SERVICE"
+
+[ ! -d "backups" ] && mkdir "backups"
+[ ! -d "deployments" ] && mkdir "deployments"
+[ ! -d "logs" ] && mkdir "logs"
+
+systemctl stop $SERVICE
+sleep 5
+
+### Check for dir, if not found create it using the mkdir ##
+bkpdir=$(date +%y%m%d%H%M%S)
+
+echo "Backup current deployment into backups/$bkpdir directory"
+[ ! -d "backups/$bkpdir" ] && mkdir "backups/$bkpdir"
+
+mv app/ lib/ quarkus/ quarkus-app-dependencies.txt quarkus-run.jar  backups/$bkpdir
+
+echo "Backup done!"
+
+echo "Installing deployment $1"
+
+unzip $1
+
+echo "Setting permissions"
+
+chown -R gbrestcomp:gbrestcomp /opt/GBREST
+
+echo "Starting deployment"
+
+systemctl start $SERVICE
+
+mv $1 deployments/
+
+echo "Deployment succesfully updated"
+
+echo "Showing service boot logs"
+
+sleep 5
+
+journalctl --since today -u $SERVICE
+
+echo "Check for errors."
+
+exit 0
+
+-----------------------
+
